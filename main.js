@@ -6,11 +6,20 @@ import { LineSegmentsGeometry } from "https://esm.sh/three@0.172.0/examples/jsm/
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 
-const SIZE = 79;
+// SIZE is only the coordinate bound of the editable region (used by inBounds,
+// the grid helper, and the world box). It deliberately does NOT size any GPU
+// buffer: the number of boundary faces and skeleton elements is bounded by the
+// cubes actually placed (a surface-area quantity), never by SIZE³, so the
+// InstancedMeshes below start small and grow on demand instead of preallocating
+// SIZE³ instances (which was ~3.2 GB of matrix buffers at SIZE=170).
+const SIZE = 170;
 const HALF = Math.floor(SIZE / 2);
 const MIN = -HALF;
 const MAX = HALF;
-const MAX_INSTANCES = SIZE * SIZE * SIZE;
+
+// Initial per-mesh instance capacity; ensureInstanceCapacity() grows it (to the
+// next power of two) whenever a render needs more.
+const INITIAL_INSTANCES = 4096;
 
 const app = document.getElementById('app');
 const errorEl = document.getElementById('error');
@@ -104,7 +113,37 @@ async function main() {
   // containing that axis (Y- and Z-normal faces, i.e. red-yellow and
   // red-blue planes) — the faces perpendicular to that axis (X-normal,
   // lying in the yellow-blue plane) stay solid.
-  const FACE_MAX_INSTANCES = MAX_INSTANCES * 2; // at most 2 boundary faces per cube per axis
+  // Build a DynamicDraw InstancedMesh with the standard per-mesh settings.
+  function makeInstancedMesh(geometry, material, capacity) {
+    const mesh = new THREE.InstancedMesh(geometry, material, capacity);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    return mesh;
+  }
+
+  // Ensure `holder[index]` (an InstancedMesh in the scene) can hold at least
+  // `needed` instances. InstancedMesh capacity is fixed at construction, so
+  // "growing" means allocating a new mesh at the next power-of-two capacity,
+  // swapping it into the scene in place of the old one, and disposing the old
+  // one. The caller writes instances immediately afterward, so we don't copy the
+  // stale matrix buffer across — only the mesh-level state that outlives a
+  // re-render (visibility, renderOrder). Returns the current mesh (grown or not).
+  function ensureInstanceCapacity(holder, index, needed) {
+    const mesh = holder[index];
+    if (needed <= mesh.instanceMatrix.count) return mesh;
+    let capacity = mesh.instanceMatrix.count || INITIAL_INSTANCES;
+    while (capacity < needed) capacity *= 2;
+    const grown = makeInstancedMesh(mesh.geometry, mesh.material, capacity);
+    grown.visible = mesh.visible;
+    grown.renderOrder = mesh.renderOrder;
+    scene.remove(mesh);
+    mesh.dispose();
+    scene.add(grown);
+    holder[index] = grown;
+    return grown;
+  }
+
   const faceGeometry = new THREE.PlaneGeometry(1, 1);
   const cubeFaceMaterials = [0, 1, 2].map(
     () =>
@@ -118,10 +157,7 @@ async function main() {
       })
   );
   const cubeFaceMeshes = cubeFaceMaterials.map((material) => {
-    const mesh = new THREE.InstancedMesh(faceGeometry, material, FACE_MAX_INSTANCES);
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    mesh.frustumCulled = false;
-    mesh.count = 0;
+    const mesh = makeInstancedMesh(faceGeometry, material, INITIAL_INSTANCES);
     scene.add(mesh);
     return mesh;
   });
@@ -153,8 +189,8 @@ async function main() {
     boundaryFaceInfoByAxis = byAxis;
 
     for (let axis = 0; axis < 3; axis++) {
-      const mesh = cubeFaceMeshes[axis];
       const axisFaces = byAxis[axis];
+      const mesh = ensureInstanceCapacity(cubeFaceMeshes, axis, axisFaces.length);
       mesh.count = axisFaces.length;
       for (let i = 0; i < axisFaces.length; i++) {
         const { sign, center } = axisFaces[i];
@@ -288,21 +324,16 @@ async function main() {
 
   const skeletonVertexGeometry = new THREE.SphereGeometry(SKELETON_VERTEX_RADIUS, 12, 8);
   const skeletonVertexMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
-  const skeletonVertexMesh = new THREE.InstancedMesh(skeletonVertexGeometry, skeletonVertexMaterial, MAX_INSTANCES);
-  skeletonVertexMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  skeletonVertexMesh.frustumCulled = false;
-  skeletonVertexMesh.count = 0;
-  scene.add(skeletonVertexMesh);
+  // Single-element holder so ensureInstanceCapacity can swap the grown mesh in.
+  const skeletonVertexHolder = [makeInstancedMesh(skeletonVertexGeometry, skeletonVertexMaterial, INITIAL_INSTANCES)];
+  scene.add(skeletonVertexHolder[0]);
 
   // Unit-height cylinder along Y; scaled/rotated/positioned per edge.
   const skeletonEdgeGeometry = new THREE.CylinderGeometry(SKELETON_EDGE_RADIUS, SKELETON_EDGE_RADIUS, 1, 8);
   const AXIS_COLORS = [0xff3b30, 0xffd60a, 0x0a84ff]; // X: red, Y: yellow, Z: blue
   const skeletonEdgeMeshes = AXIS_COLORS.map((color) => {
     const material = new THREE.MeshStandardMaterial({ color, roughness: 0.5 });
-    const mesh = new THREE.InstancedMesh(skeletonEdgeGeometry, material, MAX_INSTANCES);
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    mesh.frustumCulled = false;
-    mesh.count = 0;
+    const mesh = makeInstancedMesh(skeletonEdgeGeometry, material, INITIAL_INSTANCES);
     scene.add(mesh);
     return mesh;
   });
@@ -351,6 +382,7 @@ async function main() {
   ];
 
   function renderBrinkSkeleton(skeleton) {
+    const skeletonVertexMesh = ensureInstanceCapacity(skeletonVertexHolder, 0, skeleton.vertices.length);
     skeletonVertexMesh.count = skeleton.vertices.length;
     for (let i = 0; i < skeleton.vertices.length; i++) {
       const [x, y, z] = skeleton.vertices[i];
@@ -368,8 +400,8 @@ async function main() {
     }
 
     for (let axis = 0; axis < 3; axis++) {
-      const mesh = skeletonEdgeMeshes[axis];
       const axisEdges = edgesByAxis[axis];
+      const mesh = ensureInstanceCapacity(skeletonEdgeMeshes, axis, axisEdges.length);
       mesh.count = axisEdges.length;
       for (let i = 0; i < axisEdges.length; i++) {
         const [a, b] = axisEdges[i];
@@ -989,7 +1021,7 @@ async function main() {
   function updateBrinkSkeleton() {
     const skeleton = computeBrinkSkeleton(positions);
     currentSkeleton = skeleton;
-    logBrinkSkeleton(skeleton);
+    // logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
     const V = skeleton.vertices.length;
     const E = skeleton.edges.length;
