@@ -311,7 +311,9 @@ export function realizeAbstractSkeleton(abstract) {
  */
 export function toAbstractSkeleton(skeleton) {
   return {
-    vertexCount: skeleton.vertices.length,
+    // Prefer an explicit vertexCount (an abstract-only skeleton may carry no
+    // coordinate array), falling back to the concrete vertices' length.
+    vertexCount: Number.isInteger(skeleton.vertexCount) ? skeleton.vertexCount : skeleton.vertices.length,
     edges: skeleton.edges,
     faces: skeleton.faces,
   };

@@ -167,6 +167,10 @@ async function main() {
   let boundaryFaceInfoByAxis = [[], [], []];
 
   const faceTempMatrix = new THREE.Matrix4();
+  // Reused across all face instances so a large model (tens of thousands of
+  // boundary faces) doesn't allocate two Vector3s per instance each render.
+  const faceTempPosition = new THREE.Vector3();
+  const faceTempScale = new THREE.Vector3(1, 1, 1);
   const faceQuaternions = [
     [ // axis 0 (X): rotate the plane (default facing +Z) to face +X / -X
       new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2),
@@ -195,11 +199,8 @@ async function main() {
       for (let i = 0; i < axisFaces.length; i++) {
         const { sign, center } = axisFaces[i];
         const signIdx = sign === 1 ? 0 : 1;
-        faceTempMatrix.compose(
-          new THREE.Vector3(center[0], center[1], center[2]),
-          faceQuaternions[axis][signIdx],
-          new THREE.Vector3(1, 1, 1)
-        );
+        faceTempPosition.set(center[0], center[1], center[2]);
+        faceTempMatrix.compose(faceTempPosition, faceQuaternions[axis][signIdx], faceTempScale);
         mesh.setMatrixAt(i, faceTempMatrix);
       }
       mesh.instanceMatrix.needsUpdate = true;
@@ -375,6 +376,8 @@ async function main() {
   }
 
   const skeletonTempMatrix = new THREE.Matrix4();
+  const skeletonTempPosition = new THREE.Vector3();
+  const skeletonTempScale = new THREE.Vector3(1, 1, 1);
   const skeletonEdgeQuaternions = [
     new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -Math.PI / 2), // Y-cylinder -> X
     new THREE.Quaternion(), // Y-cylinder -> Y (identity)
@@ -409,11 +412,9 @@ async function main() {
         const midX = (a[0] + b[0]) / 2;
         const midY = (a[1] + b[1]) / 2;
         const midZ = (a[2] + b[2]) / 2;
-        skeletonTempMatrix.compose(
-          new THREE.Vector3(midX, midY, midZ),
-          skeletonEdgeQuaternions[axis],
-          new THREE.Vector3(1, length, 1)
-        );
+        skeletonTempPosition.set(midX, midY, midZ);
+        skeletonTempScale.set(1, length, 1);
+        skeletonTempMatrix.compose(skeletonTempPosition, skeletonEdgeQuaternions[axis], skeletonTempScale);
         mesh.setMatrixAt(i, skeletonTempMatrix);
       }
       mesh.instanceMatrix.needsUpdate = true;
@@ -691,16 +692,38 @@ async function main() {
       // The skeleton is present only in saved files (not autosave). Validate
       // its shape loosely — it is only consumed by the skeleton/abstract
       // load gestures, which tolerate its absence by falling back gracefully.
+      //
+      // Two tiers of validity:
+      //   - CONCRETE: `vertices` is an array of [x,y,z] points. Usable by every
+      //     gesture (the 'skeleton' fill needs real coordinates).
+      //   - ABSTRACT-ONLY: valid edges/faces plus a vertex COUNT — from an
+      //     integer `numVertices`, or the length of a `vertices` array whose
+      //     contents we don't require to be coordinates. Usable only by the
+      //     'abstract' gesture, which re-realizes coordinates from the graph.
+      // We keep `vertices` (coordinates) when present and valid, else [];
+      // `vertexCount` always carries the count so the abstract path works even
+      // when coordinates are absent.
       const skel = parsed.skeleton;
-      let skeleton =
+      const edgesValid =
         skel &&
-        Array.isArray(skel.vertices) &&
-        skel.vertices.every(isVector3Array) &&
         Array.isArray(skel.edges) &&
-        skel.edges.every((e) => Array.isArray(e) && e.length === 2 && e.every(Number.isInteger)) &&
-        Array.isArray(skel.faces) &&
-        skel.faces.every((f) => Array.isArray(f) && f.every(Number.isInteger))
-          ? { vertices: skel.vertices, edges: skel.edges, faces: skel.faces }
+        skel.edges.every((e) => Array.isArray(e) && e.length === 2 && e.every(Number.isInteger));
+      const facesValid =
+        skel && Array.isArray(skel.faces) && skel.faces.every((f) => Array.isArray(f) && f.every(Number.isInteger));
+      const concreteVertices = skel && Array.isArray(skel.vertices) && skel.vertices.every(isVector3Array);
+      const vertexCount = Number.isInteger(skel?.numVertices)
+        ? skel.numVertices
+        : Array.isArray(skel?.vertices)
+          ? skel.vertices.length
+          : null;
+      let skeleton =
+        edgesValid && facesValid && Number.isInteger(vertexCount)
+          ? {
+              vertices: concreteVertices ? skel.vertices : [],
+              vertexCount,
+              edges: skel.edges,
+              faces: skel.faces,
+            }
           : null;
 
       // Migrate skeletons saved under the OLD convention (cube centers at
@@ -709,9 +732,11 @@ async function main() {
       // +0.5 in world space, so the matching skeleton is the old vertices
       // shifted +0.5, which also makes them the integers the new pipeline
       // expects. Detect the old form by any non-integer vertex coordinate.
+      // Only concrete skeletons carry coordinates to migrate.
       if (skeleton && skeleton.vertices.some((v) => v.some((c) => !Number.isInteger(c)))) {
         skeleton = {
           vertices: skeleton.vertices.map((v) => [v[0] + 0.5, v[1] + 0.5, v[2] + 0.5]),
+          vertexCount: skeleton.vertexCount,
           edges: skeleton.edges,
           faces: skeleton.faces,
         };
@@ -785,8 +810,15 @@ async function main() {
   function applyLoadedState(state) {
     if (!state) return;
 
-    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
-    for (const { x, y, z } of state.positions) addVoxel(x, y, z);
+    // Swap the whole voxel set in ONE batch using the raw (non-recomputing)
+    // primitives, then recompute/render the skeleton exactly once at the end.
+    // Using addVoxel/removeVoxel here would recompute the brink skeleton and
+    // rebuild every instanced mesh on EACH cube — O(N²) work plus N redundant
+    // renders — which hangs and crashes the page on large models (e.g. a
+    // 37k-cube realized skeleton).
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
+    updateBrinkSkeleton();
 
     const radio = [...renderModeInputs].find((input) => input.value === state.renderMode);
     if (radio) radio.checked = true;
@@ -829,6 +861,13 @@ async function main() {
     if (interpretation === 'cubes') return state.positions;
     if (!state.skeleton) {
       console.error(`Load failed: file has no skeleton to load as "${interpretation}".`);
+      return null;
+    }
+    // The 'skeleton' gesture fills from real coordinates; an abstract-only
+    // skeleton (a graph with a vertex count but no coordinate array) has none —
+    // it can only be loaded via the 'abstract' gesture, which re-realizes them.
+    if (!state.skeleton.vertices.length && state.skeleton.vertexCount > 0) {
+      console.error('Load failed: skeleton has no vertex coordinates; use "Load Abstract" instead.');
       return null;
     }
     try {
@@ -1035,8 +1074,12 @@ async function main() {
   }
 
   function reset() {
-    for (const { x, y, z } of [...positions]) removeVoxel(x, y, z);
-    addVoxel(0, 0, 0);
+    // Batch: raw removes/add, then one recompute/render. A per-cube
+    // removeVoxel loop is O(N²) and rebuilds every InstancedMesh per cube,
+    // which locks up on large models (e.g. a 37k-cube loaded skeleton).
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    addVoxelRaw(0, 0, 0);
+    updateBrinkSkeleton();
     updateStatus(mode);
   }
 
@@ -1147,11 +1190,15 @@ async function main() {
   if (initialRadio) initialRadio.checked = true;
   setRenderMode(initialRenderMode);
 
+  // Restore the initial voxel set in ONE batch (raw adds, then a single
+  // recompute/render) — a per-cube addVoxel loop here is O(N²) and rebuilds
+  // every InstancedMesh per cube, hanging startup on large saved models.
   if (saved?.positions?.length) {
-    for (const { x, y, z } of saved.positions) addVoxel(x, y, z);
+    for (const { x, y, z } of saved.positions) addVoxelRaw(x, y, z);
   } else {
-    addVoxel(0, 0, 0);
+    addVoxelRaw(0, 0, 0);
   }
+  updateBrinkSkeleton();
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
