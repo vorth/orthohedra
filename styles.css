@@ -83,28 +83,9 @@ body {
   background: rgba(255, 122, 107, 0.2);
 }
 
-.move-modes {
-  margin-top: -2px;
-}
-
-.mode-btn.active[data-move-axis] {
-  border-color: #57d6a5;
-  background: rgba(87, 214, 165, 0.2);
-}
-
-.mode-btn.active[data-move-axis="0"] {
-  border-color: #ff3b30;
-  background: rgba(255, 59, 48, 0.22);
-}
-
-.mode-btn.active[data-move-axis="1"] {
-  border-color: #ffd60a;
-  background: rgba(255, 214, 10, 0.22);
-}
-
-.mode-btn.active[data-move-axis="2"] {
-  border-color: #0a84ff;
-  background: rgba(10, 132, 255, 0.22);
+#moveBtn.active {
+  border-color: #b98bff;
+  background: rgba(185, 139, 255, 0.2);
 }
 
 .file-actions {

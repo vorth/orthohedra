@@ -28,15 +28,10 @@ const skeletonStatsEl = document.getElementById('skeletonStats');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
 const resetBtn = document.getElementById('resetBtn');
-const moveBtns = [
-  document.getElementById('moveRedBtn'),
-  document.getElementById('moveYellowBtn'),
-  document.getElementById('moveBlueBtn'),
-];
+const moveBtn = document.getElementById('moveBtn');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
 const loadBtn = document.getElementById('loadBtn');
-const loadSkeletonBtn = document.getElementById('loadSkeletonBtn');
 const loadAbstractBtn = document.getElementById('loadAbstractBtn');
 const busyOverlay = document.getElementById('busyOverlay');
 const cancelBusyBtn = document.getElementById('cancelBusyBtn');
@@ -448,12 +443,12 @@ async function main() {
   }
 
   // --- Move mode: drag a connected boundary face along its orthogonal axis --
-  // `moveAxis` is null outside move mode, else 0/1/2 (X=red, Y=yellow, Z=blue).
-  // Move mode only governs which faces are grabbable — the boundary faces whose
-  // NORMAL is the edit axis (those never contain an edit-axis edge, so they can
-  // be grabbed and dragged freely along that axis). Rendering is independent and
-  // driven entirely by per-axis face visibility (see applyFaceVisibility).
-  let moveAxis = null;
+  // `moveMode` is a single toggle. While active, ANY visible boundary face can
+  // be grabbed; the axis of the face hit (its normal) becomes the drag axis, so
+  // the face slides freely along that axis. Invisible (hidden) faces aren't
+  // grabbable. Rendering is independent and driven entirely by per-axis face
+  // visibility (see applyFaceVisibility).
+  let moveMode = false;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
 
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
@@ -1052,8 +1047,7 @@ async function main() {
   }
 
   function updateStatus(mode) {
-    const MOVE_LABELS = ['Move Red', 'Move Yellow', 'Move Blue'];
-    const label = moveAxis !== null ? MOVE_LABELS[moveAxis] : mode === 'build' ? 'Build' : 'Destroy';
+    const label = moveMode ? 'Move' : mode === 'build' ? 'Build' : 'Destroy';
     statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
   }
 
@@ -1235,21 +1229,20 @@ async function main() {
 
   function setMode(nextMode) {
     mode = nextMode;
-    setMoveAxis(null); // Build/Destroy and Move are mutually exclusive
+    setMoveMode(false); // Build/Destroy and Move are mutually exclusive
     buildBtn.classList.toggle('active', mode === 'build');
     destroyBtn.classList.toggle('active', mode === 'destroy');
     updateStatus(mode);
   }
 
-  function setMoveAxis(axis) {
-    if (moveAxis === axis) return;
+  function setMoveMode(on) {
+    if (moveMode === on) return;
     cancelDrag();
-    moveAxis = axis;
-    for (let a = 0; a < 3; a++) moveBtns[a].classList.toggle('active', a === axis);
-    // Rendering is decoupled from the move gesture: the render mode chosen via
-    // the radios stays in effect whether or not a move axis is active, so we
-    // neither override the rendering here nor disable the radios.
-    if (axis === null) {
+    moveMode = on;
+    moveBtn.classList.toggle('active', on);
+    // Rendering is decoupled from the move gesture: face visibility stays in
+    // effect whether or not move mode is active.
+    if (!on) {
       hideAvailablePlanes();
     } else {
       // Leaving Build/Destroy: drop their active styling and status.
@@ -1260,9 +1253,8 @@ async function main() {
     }
   }
 
-  function enterMoveMode(axis) {
-    // Toggle off if the same axis button is clicked again.
-    setMoveAxis(moveAxis === axis ? null : axis);
+  function toggleMoveMode() {
+    setMoveMode(!moveMode);
   }
 
   function getIntersection(clientX, clientY, meshes = cubeFaceMeshes) {
@@ -1298,7 +1290,7 @@ async function main() {
       return;
     }
 
-    if (moveAxis !== null) return; // move mode has its own drag interaction
+    if (moveMode) return; // move mode has its own drag interaction
 
     const hit = hits[0];
     const id = hit.instanceId;
@@ -1460,12 +1452,11 @@ async function main() {
   buildBtn.addEventListener('click', () => setMode('build'));
   destroyBtn.addEventListener('click', () => setMode('destroy'));
   resetBtn.addEventListener('click', () => reset());
-  moveBtns.forEach((btn, axis) => btn.addEventListener('click', () => enterMoveMode(axis)));
+  moveBtn.addEventListener('click', () => toggleMoveMode());
 
   saveBtn.addEventListener('click', () => save());
   saveAsBtn.addEventListener('click', () => saveAs());
   loadBtn.addEventListener('click', () => load('cubes'));
-  loadSkeletonBtn.addEventListener('click', () => load('skeleton'));
   loadAbstractBtn.addEventListener('click', () => load('abstract'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
@@ -1473,13 +1464,14 @@ async function main() {
     downX = event.clientX;
     downY = event.clientY;
 
-    // In move mode, grabbing a rendered (edit-axis-normal) face starts a drag
-    // and suspends the trackball so the camera doesn't rotate mid-drag.
-    if (moveAxis !== null && !busy) {
-      const hits = getIntersection(event.clientX, event.clientY, [cubeFaceMeshes[moveAxis]]);
-      const hit = hits[0];
+    // In move mode, grabbing ANY visible boundary face starts a drag along that
+    // face's normal axis, and suspends the trackball so the camera doesn't
+    // rotate mid-drag. The axis is whichever face mesh was hit.
+    if (moveMode && !busy) {
+      const hit = getIntersection(event.clientX, event.clientY)[0];
       if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
-        if (startDrag(moveAxis, hit.instanceId)) {
+        const axis = cubeFaceMeshes.indexOf(hit.object);
+        if (axis !== -1 && startDrag(axis, hit.instanceId)) {
           hoverOutline.visible = false;
           event.preventDefault();
         }
@@ -1493,10 +1485,9 @@ async function main() {
       return;
     }
 
-    // Hover highlight: only over grabbable faces. In move mode that's the
-    // edit-axis-normal mesh; otherwise any boundary face.
-    const meshes = moveAxis !== null ? [cubeFaceMeshes[moveAxis]] : cubeFaceMeshes;
-    const hits = getIntersection(event.clientX, event.clientY, meshes);
+    // Hover highlight over any grabbable (visible) boundary face — the same set
+    // in move mode and in build/destroy, since move now grabs any visible face.
+    const hits = getIntersection(event.clientX, event.clientY);
     if (!hits.length || hits[0].instanceId === undefined || hits[0].instanceId === null) {
       hoverOutline.visible = false;
       return;
