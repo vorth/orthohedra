@@ -639,8 +639,11 @@ async function main() {
       hi = 0;
     }
 
+    // A boundary face plane can lie anywhere from MIN to MAX+1 (the giant
+    // boundary cube spans world volume [MIN, MAX+1]); never offer a landing
+    // plane outside it.
     const values = [];
-    for (let v = lo - 3; v <= hi + 3; v++) {
+    for (let v = Math.max(lo - 3, MIN); v <= Math.min(hi + 3, MAX + 1); v++) {
       if (v === excludeCoord) continue;
       if (!occupiedVals.has(v)) values.push(v);
     }
