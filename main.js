@@ -351,6 +351,39 @@ async function main() {
   const skeletonVertexHolder = [makeInstancedMesh(skeletonVertexGeometry, skeletonVertexMaterial, INITIAL_INSTANCES)];
   scene.add(skeletonVertexHolder[0]);
 
+  // Impeding-vertex highlight: during a move-mode drag, the barrier vertices
+  // that block the drag (the collinear neighbors a dragged vertex must not
+  // pass) are marked with a slightly larger red-emissive sphere, drawn over
+  // the white vertex spheres. `count` is set per drag from dragBounds().
+  const IMPEDER_MAX = 64; // more than any face's vertex count * 2 barriers
+  const impederGeometry = new THREE.SphereGeometry(SKELETON_VERTEX_RADIUS * 1.35, 12, 8);
+  const impederMaterial = new THREE.MeshStandardMaterial({
+    color: 0xff2020,
+    emissive: 0xff0000,
+    emissiveIntensity: 0.9,
+    roughness: 0.5,
+  });
+  const impederMesh = makeInstancedMesh(impederGeometry, impederMaterial, IMPEDER_MAX);
+  impederMesh.renderOrder = 4;
+  impederMesh.count = 0;
+  scene.add(impederMesh);
+
+  const _impederMatrix = new THREE.Matrix4();
+  function showImpeders(points) {
+    const n = Math.min(points.length, IMPEDER_MAX);
+    for (let i = 0; i < n; i++) {
+      const [x, y, z] = points[i];
+      _impederMatrix.makeTranslation(x, y, z);
+      impederMesh.setMatrixAt(i, _impederMatrix);
+    }
+    impederMesh.count = n;
+    impederMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  function hideImpeders() {
+    impederMesh.count = 0;
+  }
+
   // Unit-height cylinder along Y; scaled/rotated/positioned per edge.
   const skeletonEdgeGeometry = new THREE.CylinderGeometry(SKELETON_EDGE_RADIUS, SKELETON_EDGE_RADIUS, 1, 8);
   // Skeleton edges are always rendered (their visibility is no longer tied to
@@ -648,6 +681,56 @@ async function main() {
       if (!occupiedVals.has(v)) values.push(v);
     }
     return values;
+  }
+
+  // The open interval (lo, hi) of edit-axis values a dragged face may move to
+  // without any of its vertices overlapping a collinear skeleton edge, plus the
+  // list of `impeders` — the barrier vertices themselves (world positions), for
+  // highlighting (at most two per dragged vertex).
+  //
+  // Each dragged vertex V sits on some edit-axis-parallel line and is one end
+  // of an axis-collinear skeleton edge [V, W] (its coordinate shifts on the
+  // drag). V may pass W (that edge simply reverses), but must not pass any
+  // OTHER vertex on that line — doing so would make [V, W] overlap the
+  // neighboring collinear edge. On the sorted line, edges pair consecutive
+  // vertices, so the barriers bounding V's motion are the vertices immediately
+  // outside the {V, W} pair: the one just below the pair, and the one just
+  // above it. V (and W) may sweep freely strictly between those two barriers.
+  function dragBounds(axis, vertexIndices, skeleton) {
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    // Vertices grouped by the axis-parallel line they lie on, sorted along axis.
+    const byLine = new Map(); // "u,v" -> [{ coord, point }] sorted by coord
+    for (const p of skeleton.vertices) {
+      const k = `${p[ua]},${p[ub]}`;
+      if (!byLine.has(k)) byLine.set(k, []);
+      byLine.get(k).push({ coord: p[axis], point: p });
+    }
+    for (const arr of byLine.values()) arr.sort((a, b) => a.coord - b.coord);
+
+    // The drag axis is orthogonal to the face, so each dragged vertex has a
+    // distinct in-plane (u,v): no axis-parallel drag line carries two of them.
+    let lo = -Infinity;
+    let hi = Infinity;
+    const impeders = [];
+    for (const vi of vertexIndices) {
+      const p = skeleton.vertices[vi];
+      const line = byLine.get(`${p[ua]},${p[ub]}`);
+      // Locate the {V, W} pair on the line. Edges pair consecutive vertices
+      // (1st-2nd, 3rd-4th, ...), so the pair's start index is even.
+      const i = line.findIndex((e) => e.coord === p[axis]);
+      const pairStart = i - (i % 2); // even index: lower member of the pair
+      const below = pairStart - 1 >= 0 ? line[pairStart - 1] : null;
+      const above = pairStart + 2 < line.length ? line[pairStart + 2] : null;
+      if (below) {
+        if (below.coord > lo) lo = below.coord;
+        impeders.push(below.point);
+      }
+      if (above) {
+        if (above.coord < hi) hi = above.coord;
+        impeders.push(above.point);
+      }
+    }
+    return { lo, hi, impeders };
   }
 
   const occupied = new Map();
@@ -1319,6 +1402,9 @@ async function main() {
   // --- Move-mode drag state and geometry -----------------------------------
   const SNAP_THRESHOLD = 0.3; // commit only if drag value is within this of a plane
   let drag = null; // { axis, face, skeleton, planes, linePoint, dragValue }
+  // A grabbed-but-trapped face (grabbable, but with no legal destination): the
+  // gesture is consumed and its impeders shown, but there is no live drag.
+  let trapped = false;
 
   // Closest edit-axis value on the line through `linePoint` (parallel to
   // `axis`) to the pointer ray — the drag value. Derived by minimizing the
@@ -1371,9 +1457,22 @@ async function main() {
 
   function startDrag(axis, hitId) {
     const face = connectedFace(axis, hitId);
-    if (!face) return false;
-    const values = computeAvailablePlanes(axis, face.coord);
-    if (!values.length) return false;
+    if (!face) return false; // not a grabbable face: let the gesture rotate the camera
+    // Candidate destination planes, then discard any that would drive a dragged
+    // vertex past a collinear neighbor (overlapping the neighboring edge).
+    const { lo, hi, impeders } = dragBounds(axis, face.vertexIndices, currentSkeleton);
+    const values = computeAvailablePlanes(axis, face.coord).filter((v) => v > lo && v < hi);
+    if (!values.length) {
+      // The face is grabbable but boxed in — every candidate plane is occupied
+      // or blocked by a collinear neighbor, so there is nowhere legal to move.
+      // Still CONSUME the gesture (suspend the trackball) and show the impeders,
+      // so it reads as "trapped, here's why" instead of an unexpected camera
+      // rotation. No live `drag`: pointermove/up just clear the preview.
+      trapped = true;
+      controls.enabled = false;
+      showImpeders(impeders);
+      return true;
+    }
 
     // A point on the face (a segment endpoint lifted into the current plane)
     // gives the axis-parallel line the pointer ray is projected onto.
@@ -1393,6 +1492,7 @@ async function main() {
     };
     controls.enabled = false;
     showAvailablePlanes(axis, values, face.segments);
+    showImpeders(impeders);
     renderDragIndicator(axis, face.segments, face.coord, false);
     return true;
   }
@@ -1443,13 +1543,15 @@ async function main() {
 
   function endDrag() {
     drag = null;
+    trapped = false;
     controls.enabled = true;
     hideDragIndicator();
     hideAvailablePlanes();
+    hideImpeders();
   }
 
   function cancelDrag() {
-    if (drag) endDrag();
+    if (drag || trapped) endDrag();
   }
 
   buildBtn.addEventListener('click', () => setMode('build'));
@@ -1507,6 +1609,10 @@ async function main() {
   renderer.domElement.addEventListener('pointerup', (event) => {
     if (drag) {
       commitDrag();
+      return;
+    }
+    if (trapped) {
+      endDrag(); // clear the trapped-face preview; nothing to commit
       return;
     }
     const dist = Math.hypot(event.clientX - downX, event.clientY - downY);
