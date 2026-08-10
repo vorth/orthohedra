@@ -33,7 +33,6 @@ const moveBtns = [
   document.getElementById('moveYellowBtn'),
   document.getElementById('moveBlueBtn'),
 ];
-const renderModeInputs = document.querySelectorAll('input[name="renderMode"]');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
 const loadBtn = document.getElementById('loadBtn');
@@ -44,7 +43,7 @@ const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
 async function main() {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0a1020);
+  scene.background = new THREE.Color(0x1a1a1a);
 
   const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 300);
   camera.position.set(3.2, 2.3, 3.2);
@@ -88,6 +87,13 @@ async function main() {
 
   scene.add(camera);
 
+  // Per-axis colors, shared by the skeleton edges, the small boundary-cube
+  // faces, and the giant boundary cube: X red, Y yellow, Z blue.
+  const AXIS_COLORS = [0xff3b30, 0xffd60a, 0x0a84ff];
+  // The same colors lightened ~30% toward white, used to tint the quad faces
+  // so they read as a softer shade of their normal-axis color.
+  const FACE_COLORS = [0xff766e, 0xffe254, 0x53a9ff];
+
   // Cubes are identified by their least (min-x,y,z) corner, so a cube at
   // least corner c occupies [c, c+1]; with inBounds allowing MIN..MAX, the
   // occupied world volume is [MIN, MAX+1].
@@ -95,18 +101,37 @@ async function main() {
     new THREE.Vector3(MIN, MIN, MIN),
     new THREE.Vector3(MAX + 1, MAX + 1, MAX + 1)
   );
+
+  // The giant boundary cube is drawn as just a wireframe outline (Box3Helper),
+  // but backed by an invisible, still-clickable box of solid faces: clicking a
+  // face cycles that axis's small-cube-face visibility (solid -> translucent ->
+  // hidden). The mesh's `visible` stays true so the raycaster still hits it;
+  // only the MATERIALS are non-rendering (material.visible = false), which
+  // suppresses drawing without removing it from picking. Its BoxGeometry emits
+  // 6 material groups in order +X,-X,+Y,-Y,+Z,-Z; we pair opposite faces onto
+  // one material per axis so a ray hit's materialIndex maps straight to the
+  // axis (materialIndex >> 1).
   const boundsHelper = new THREE.Box3Helper(bounds, 0x3e4f8c);
   scene.add(boundsHelper);
 
-  const grid = new THREE.GridHelper(SIZE + 1, SIZE + 1, 0x2f3d74, 0x22315f);
-  // Sit the grid at the volume's lower Y face (y = MIN) and center it over
-  // the [MIN, MAX+1] volume, whose midpoint is 0.5 on X and Z.
-  grid.position.set(0.5, MIN, 0.5);
-  scene.add(grid);
+  const boundsCenter = new THREE.Vector3();
+  bounds.getCenter(boundsCenter);
+  const boundsSize = new THREE.Vector3();
+  bounds.getSize(boundsSize);
+  const boundsGeometry = new THREE.BoxGeometry(boundsSize.x, boundsSize.y, boundsSize.z);
+  const boundsMaterials = [0, 1, 2].map(
+    () => new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })
+  );
+  const boundsBox = new THREE.Mesh(
+    boundsGeometry,
+    [boundsMaterials[0], boundsMaterials[0], boundsMaterials[1], boundsMaterials[1], boundsMaterials[2], boundsMaterials[2]]
+  );
+  boundsBox.position.copy(boundsCenter);
+  scene.add(boundsBox);
 
   // Boundary cube faces: one unit quad per non-internal cube face (every
   // face except those sandwiched between two present cubes) — replaces
-  // rendering whole green cubes. Faces are split into 3 meshes by their
+  // rendering whole solid cubes. Faces are split into 3 meshes by their
   // normal axis (X/Y/Z) so each orientation's transparency can be
   // controlled independently: hiding one axis's skeleton edges (e.g. "no
   // red") should only make transparent the faces that LIE IN a plane
@@ -145,10 +170,12 @@ async function main() {
   }
 
   const faceGeometry = new THREE.PlaneGeometry(1, 1);
+  // Each axis's faces are tinted with that axis's FACE_COLORS shade (X red,
+  // Y yellow, Z blue, lightened slightly toward white).
   const cubeFaceMaterials = [0, 1, 2].map(
-    () =>
+    (axis) =>
       new THREE.MeshStandardMaterial({
-        color: 0x57d6a5,
+        color: FACE_COLORS[axis],
         roughness: 0.64,
         metalness: 0.05,
         transparent: true,
@@ -331,7 +358,8 @@ async function main() {
 
   // Unit-height cylinder along Y; scaled/rotated/positioned per edge.
   const skeletonEdgeGeometry = new THREE.CylinderGeometry(SKELETON_EDGE_RADIUS, SKELETON_EDGE_RADIUS, 1, 8);
-  const AXIS_COLORS = [0xff3b30, 0xffd60a, 0x0a84ff]; // X: red, Y: yellow, Z: blue
+  // Skeleton edges are always rendered (their visibility is no longer tied to
+  // face visibility) — colored by axis with the full-strength AXIS_COLORS.
   const skeletonEdgeMeshes = AXIS_COLORS.map((color) => {
     const material = new THREE.MeshStandardMaterial({ color, roughness: 0.5 });
     const mesh = makeInstancedMesh(skeletonEdgeGeometry, material, INITIAL_INSTANCES);
@@ -339,40 +367,38 @@ async function main() {
     return mesh;
   });
 
-  // Render modes: "normal" shows opaque cubes and all three edge
-  // colors; each "no-X" mode makes the cubes transparent and
-  // hides that one axis's edges, so the remaining brink skeleton is
-  // easier to see through the cube volume.
-  const AXIS_INDEX_BY_HIDDEN_COLOR = { 'no-red': 0, 'no-yellow': 1, 'no-blue': 2 };
-  let currentRenderMode = 'normal';
+  // Per-axis face visibility, a tri-state cycled by clicking the giant boundary
+  // cube's faces: SOLID -> TRANSLUCENT -> HIDDEN -> SOLID. Each axis (X/Y/Z)
+  // is controlled independently. `faceVisibility[axis]` holds the current state.
+  const FACE_SOLID = 2;
+  const FACE_TRANSLUCENT = 1;
+  const FACE_HIDDEN = 0;
+  const faceVisibility = [FACE_SOLID, FACE_SOLID, FACE_SOLID];
 
-  function setRenderMode(mode) {
-    currentRenderMode = mode;
-    const hiddenAxis = AXIS_INDEX_BY_HIDDEN_COLOR[mode];
+  // Apply `faceVisibility` to the small boundary-cube face meshes. A translucent
+  // material that still writes depth marks its pixels as occupied at its own
+  // (nearer) depth, so solid geometry drawn later at a greater depth fails the
+  // depth test and vanishes instead of showing through; disable depth writes
+  // while translucent and render those meshes after (renderOrder 1) the opaque
+  // ones (renderOrder 0) so depth/color are established before they blend on top.
+  function applyFaceVisibility() {
     for (let axis = 0; axis < 3; axis++) {
-      // All three face meshes are shown in every render mode (Move mode hides
-      // two of them via .visible; restore that here). Transparency is what
-      // "no-X" modes use, controlled by opacity/depthWrite below.
-      cubeFaceMeshes[axis].visible = true;
-      skeletonEdgeMeshes[axis].visible = axis !== hiddenAxis;
-      // A face's plane contains the hidden axis unless the face's own
-      // normal IS that axis — e.g. hiding red (X) leaves X-normal faces
-      // (the yellow-blue plane) solid, and makes Y-normal/Z-normal faces
-      // (red-blue and red-yellow planes) transparent.
-      const faceContainsHiddenAxis = hiddenAxis !== undefined && axis !== hiddenAxis;
+      const state = faceVisibility[axis];
+      const mesh = cubeFaceMeshes[axis];
       const material = cubeFaceMaterials[axis];
-      material.opacity = faceContainsHiddenAxis ? 0.2 : 1;
-      // A transparent material that still writes depth marks those pixels
-      // as occupied at its own (nearer) depth; solid geometry drawn
-      // afterward at a greater depth then fails the depth test there and
-      // never gets rasterized, making it vanish instead of showing
-      // through the transparent face. Only disable depth writes while
-      // actually transparent, and make sure the opaque axis mesh renders
-      // first (renderOrder 0) so its depth/color are already established
-      // before the transparent ones (renderOrder 1) blend on top of it.
-      material.depthWrite = !faceContainsHiddenAxis;
-      cubeFaceMeshes[axis].renderOrder = faceContainsHiddenAxis ? 1 : 0;
+      mesh.visible = state !== FACE_HIDDEN;
+      const translucent = state === FACE_TRANSLUCENT;
+      material.opacity = translucent ? 0.3 : 1;
+      material.depthWrite = !translucent;
+      mesh.renderOrder = translucent ? 1 : 0;
     }
+  }
+
+  // Advance one axis's face visibility to the next state in the cycle.
+  function cycleFaceVisibility(axis) {
+    faceVisibility[axis] = (faceVisibility[axis] + 2) % 3; // 2->1->0->2
+    applyFaceVisibility();
+    saveToLocalStorage();
   }
 
   const skeletonTempMatrix = new THREE.Matrix4();
@@ -423,24 +449,12 @@ async function main() {
 
   // --- Move mode: drag a connected boundary face along its orthogonal axis --
   // `moveAxis` is null outside move mode, else 0/1/2 (X=red, Y=yellow, Z=blue).
-  // In move mode we display the full skeleton but only the boundary faces whose
+  // Move mode only governs which faces are grabbable — the boundary faces whose
   // NORMAL is the edit axis (those never contain an edit-axis edge, so they can
-  // be grabbed and dragged freely along that axis).
+  // be grabbed and dragged freely along that axis). Rendering is independent and
+  // driven entirely by per-axis face visibility (see applyFaceVisibility).
   let moveAxis = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
-
-  function setMoveRender(axis) {
-    for (let a = 0; a < 3; a++) {
-      // All edges visible (full skeleton).
-      skeletonEdgeMeshes[a].visible = true;
-      // Only the edit-axis-normal face mesh is shown, fully opaque.
-      const shown = a === axis;
-      cubeFaceMeshes[a].visible = shown;
-      cubeFaceMaterials[a].opacity = 1;
-      cubeFaceMaterials[a].depthWrite = true;
-      cubeFaceMeshes[a].renderOrder = 0;
-    }
-  }
 
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
   // at the grabbed quad's coordinate) that the grabbed quad belongs to. Returns
@@ -642,7 +656,19 @@ async function main() {
   const positions = [];
 
   const STORAGE_KEY = 'cubes-editor:state';
-  const RENDER_MODES = new Set(['normal', 'no-red', 'no-yellow', 'no-blue']);
+  // Old render-mode strings, migrated to a `faceVisibility` tri-state array on
+  // load. "normal" -> all solid; each "no-X" made the faces IN A PLANE
+  // CONTAINING that color translucent (the other two axes), leaving that axis
+  // solid — reproduced here as [X,Y,Z] translucency.
+  const LEGACY_RENDER_MODE_VISIBILITY = {
+    normal: [FACE_SOLID, FACE_SOLID, FACE_SOLID],
+    'no-red': [FACE_SOLID, FACE_TRANSLUCENT, FACE_TRANSLUCENT],
+    'no-yellow': [FACE_TRANSLUCENT, FACE_SOLID, FACE_TRANSLUCENT],
+    'no-blue': [FACE_TRANSLUCENT, FACE_TRANSLUCENT, FACE_SOLID],
+  };
+
+  const isFaceVisibility = (v) =>
+    Array.isArray(v) && v.length === 3 && v.every((s) => s === FACE_SOLID || s === FACE_TRANSLUCENT || s === FACE_HIDDEN);
 
   // The autosave-to-localStorage path and the file-save paths share this
   // serializer, but the brink skeleton is included ONLY in saved files
@@ -653,7 +679,7 @@ async function main() {
   function currentStateJSON(includeSkeleton = false) {
     const state = {
       positions,
-      renderMode: currentRenderMode,
+      faceVisibility,
       camera: {
         position: camera.position.toArray(),
         target: controls.target.toArray(),
@@ -681,7 +707,11 @@ async function main() {
           )
         : [];
 
-      const renderMode = RENDER_MODES.has(parsed.renderMode) ? parsed.renderMode : 'normal';
+      // Prefer the new tri-state array; fall back to migrating a legacy
+      // `renderMode` string; else default to all-solid.
+      const faceVis = isFaceVisibility(parsed.faceVisibility)
+        ? parsed.faceVisibility
+        : LEGACY_RENDER_MODE_VISIBILITY[parsed.renderMode] ?? [FACE_SOLID, FACE_SOLID, FACE_SOLID];
 
       const isVector3Array = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
       const cameraState =
@@ -742,7 +772,7 @@ async function main() {
         };
       }
 
-      return { positions, renderMode, camera: cameraState, skeleton };
+      return { positions, faceVisibility: faceVis, camera: cameraState, skeleton };
     } catch {
       return null;
     }
@@ -820,9 +850,8 @@ async function main() {
     for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
     updateBrinkSkeleton();
 
-    const radio = [...renderModeInputs].find((input) => input.value === state.renderMode);
-    if (radio) radio.checked = true;
-    setRenderMode(state.renderMode);
+    faceVisibility.splice(0, 3, ...state.faceVisibility);
+    applyFaceVisibility();
 
     if (state.camera) {
       camera.position.fromArray(state.camera.position);
@@ -1170,7 +1199,7 @@ async function main() {
     }
   }
 
-  // Restore previously saved state, if any: render mode and camera first
+  // Restore previously saved state, if any: face visibility and camera first
   // (so the position-restoring addVoxel calls below, which each trigger a
   // save, re-persist the already-correct values instead of clobbering
   // them with defaults), then the assembly itself. A `design` URL param, if
@@ -1184,11 +1213,8 @@ async function main() {
     controls.update();
   }
 
-  const radioForMode = (mode) => [...renderModeInputs].find((input) => input.value === mode);
-  const initialRenderMode = saved?.renderMode ?? 'normal';
-  const initialRadio = radioForMode(initialRenderMode);
-  if (initialRadio) initialRadio.checked = true;
-  setRenderMode(initialRenderMode);
+  if (saved?.faceVisibility) faceVisibility.splice(0, 3, ...saved.faceVisibility);
+  applyFaceVisibility();
 
   // Restore the initial voxel set in ONE batch (raw adds, then a single
   // recompute/render) — a per-cube addVoxel loop here is O(N²) and rebuilds
@@ -1220,19 +1246,16 @@ async function main() {
     cancelDrag();
     moveAxis = axis;
     for (let a = 0; a < 3; a++) moveBtns[a].classList.toggle('active', a === axis);
-    // The render-mode radios don't apply during move mode (which drives its own
-    // special rendering), so disable them while a move axis is active and
-    // re-enable them on exit.
-    renderModeInputs.forEach((input) => (input.disabled = axis !== null));
+    // Rendering is decoupled from the move gesture: the render mode chosen via
+    // the radios stays in effect whether or not a move axis is active, so we
+    // neither override the rendering here nor disable the radios.
     if (axis === null) {
       hideAvailablePlanes();
-      setRenderMode(currentRenderMode); // restore the standard render mode
     } else {
       // Leaving Build/Destroy: drop their active styling and status.
       buildBtn.classList.remove('active');
       destroyBtn.classList.remove('active');
       hoverOutline.visible = false;
-      setMoveRender(axis);
       updateStatus(mode);
     }
   }
@@ -1247,14 +1270,35 @@ async function main() {
     pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(pointer, camera);
-    return raycaster.intersectObjects(meshes, false);
+    // intersectObjects raycasts every mesh passed directly in the array
+    // regardless of its `.visible` flag (visibility is only honored when
+    // descending into CHILDREN during recursive traversal). Filter to visible
+    // meshes ourselves so hidden faces aren't pickable — letting clicks and
+    // hover pass through to interior orthogonal faces behind them.
+    return raycaster.intersectObjects(meshes.filter((m) => m.visible), false);
   }
 
   function handleEdit(clientX, clientY) {
     if (busy) return; // edits are suspended while a realization runs
-    if (moveAxis !== null) return; // move mode has its own drag interaction
     const hits = getIntersection(clientX, clientY);
-    if (!hits.length) return;
+
+    // A click that misses every small boundary-cube face falls through to the
+    // giant boundary cube: hitting one of its faces cycles that axis's face
+    // visibility (solid -> translucent -> hidden). Checked before the move-mode
+    // early return so this rendering control works in any editing mode. The
+    // ray crosses two walls (the box faces are DoubleSide), returned sorted
+    // near->far; take the LAST so we cycle the FAR face the user actually sees,
+    // not the near wall in front of the camera.
+    if (!hits.length) {
+      const boxHits = getIntersection(clientX, clientY, [boundsBox]);
+      const farHit = boxHits[boxHits.length - 1];
+      if (farHit && farHit.face) {
+        cycleFaceVisibility(farHit.face.materialIndex >> 1);
+      }
+      return;
+    }
+
+    if (moveAxis !== null) return; // move mode has its own drag interaction
 
     const hit = hits[0];
     const id = hit.instanceId;
@@ -1424,15 +1468,6 @@ async function main() {
   loadSkeletonBtn.addEventListener('click', () => load('skeleton'));
   loadAbstractBtn.addEventListener('click', () => load('abstract'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
-
-  renderModeInputs.forEach((input) => {
-    input.addEventListener('change', () => {
-      if (input.checked) {
-        setRenderMode(input.value);
-        saveToLocalStorage();
-      }
-    });
-  });
 
   renderer.domElement.addEventListener('pointerdown', (event) => {
     downX = event.clientX;

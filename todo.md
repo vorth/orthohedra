@@ -9,6 +9,7 @@
 - fix face drag:
   - just one mode; ray determines face and drag axis
   - show "have room" planes in orange, where no face collision, allow drop
+  - fix boundary bug
 - change mode controls
   - modifier keys for mouse
   - mode selector for touch
