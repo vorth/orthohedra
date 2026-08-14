@@ -484,171 +484,79 @@ async function main() {
   let moveMode = false;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
 
+  // Squared distance from point (px,pv) to the segment (ax,av)-(bx,bv), in 2D.
+  function pointSegDist2(px, pv, ax, av, bx, bv) {
+    const dx = bx - ax;
+    const dv = bv - av;
+    const len2 = dx * dx + dv * dv;
+    let t = len2 === 0 ? 0 : ((px - ax) * dx + (pv - av) * dv) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = ax + t * dx;
+    const cv = av + t * dv;
+    return (px - cx) * (px - cx) + (pv - cv) * (pv - cv);
+  }
+
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
-  // at the grabbed quad's coordinate) that the grabbed quad belongs to. Returns
-  // { coord, vertexIndices, segments }: the shared edit-axis coordinate, the
-  // face's skeleton vertex indices (whose coordinate the drag shifts on commit),
-  // and its edges as in-plane [au,av,bu,bv] segments (for the drag visuals), or
-  // null if no bounding face was found.
+  // at the grabbed quad's coordinate) whose edges the grabbed quad is nearest.
+  // Returns { coord, vertexIndices, segments }: the shared edit-axis coordinate,
+  // the face's skeleton vertex indices (whose coordinate the drag shifts on
+  // commit), and its edges as in-plane [au,av,bu,bv] segments (for the drag
+  // visuals), or null if no bounding face was found.
   //
-  // Algorithm (per the brink-skeleton parity rules): flood-fill EDGE-ADJACENT
-  // squares, never crossing an in-plane skeleton edge (a wall). A fill region
-  // either (A) reaches a skeleton VERTEX — which pins the containing face, and
-  // we STOP: the face is all the commit and visuals need — or (B) exhausts as a
-  // rectangle without one (e.g. an arm of a crossing where the bounding vertices
-  // cancelled by parity), whereupon we corner-jump into the next region. Jumping
-  // only NON-vertex corners (a diagonal there passes two walls at once, legal;
-  // over a vertex would cross a single wall) keeps the search inside the one
-  // face by the parity invariants — perpendicular crossing faces aren't merged.
-  function connectedFace(axis, startId) {
+  // A single grid plane at one coord may hold SEVERAL disjoint brink-skeleton
+  // face cycles — e.g. eight squares around an empty center give an outer ring
+  // cycle and an inner hole cycle. By the parity construction (see
+  // brinkSkeleton.js) these cycles never share an edge and touch only at
+  // non-extremal points, so they are genuinely disjoint edge sets. We therefore
+  // select by the ACTUAL click point: build the in-plane cycles, then pick the
+  // one whose nearest edge is closest to where the ray met the grabbed quad,
+  // rather than whichever the flood-fill happened to reach first.
+  function connectedFace(axis, startId, hitPoint) {
     const faces = boundaryFaceInfoByAxis[axis];
     const coord = Math.round(faces[startId].center[axis]);
     const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
 
-    // Squares at this coordinate, keyed by in-plane integer least corner "u,v"
-    // (a quad center is the cube center in-plane, so least corner = center-0.5).
-    const squareId = new Map(); // "u,v" -> instance id
-    const uvOf = new Map(); // instance id -> [u, v]
-    for (let id = 0; id < faces.length; id++) {
-      if (Math.round(faces[id].center[axis]) !== coord) continue;
-      const u = Math.round(faces[id].center[ua] - 0.5);
-      const v = Math.round(faces[id].center[ub] - 0.5);
-      squareId.set(`${u},${v}`, id);
-      uvOf.set(id, [u, v]);
-    }
+    // In-plane click coordinates. Fall back to the grabbed quad's center if no
+    // hit point was supplied.
+    const hu = hitPoint ? hitPoint.getComponent(ua) : faces[startId].center[ua];
+    const hv = hitPoint ? hitPoint.getComponent(ub) : faces[startId].center[ub];
 
-    // In-plane skeleton data. IMPORTANT: a skeleton edge pairs CONSECUTIVE
-    // extremal vertices along a line, so it can span MANY unit cells and pass
-    // through intermediate non-vertex lattice points. We decompose every
-    // in-plane edge into its UNIT segments so per-cell wall lookups match, and
-    // key each unit segment canonically by its two endpoints.
-    const segKey = (au, av, bu, bv) =>
-      au < bu || (au === bu && av <= bv) ? `${au},${av}|${bu},${bv}` : `${bu},${bv}|${au},${av}`;
-    const walls = new Set(); // unit wall segments
-    const planeVertices = new Set(); // "u,v" of skeleton vertices in this plane
-    // Each in-plane face cycle, with the info the drag needs: the skeleton
-    // vertex indices to shift on commit, and its edges as in-plane [au,av,bu,bv]
-    // segments for the drag visuals. `faceAtVertex` maps a vertex "u,v" to the
-    // cycle(s) through it, so a reached vertex pins the containing face.
-    const planeFaces = []; // [{ vertexIndices:[], segments:[[au,av,bu,bv]] }]
-    const faceAtVertex = new Map(); // "u,v" -> planeFaces index
-    if (currentSkeleton) {
-      for (const [vi, vj] of currentSkeleton.edges) {
+    if (!currentSkeleton) return null;
+
+    // The in-plane face cycles at this coord, each with the info the drag needs:
+    // the skeleton vertex indices to shift on commit, and its edges as in-plane
+    // [au,av,bu,bv] segments for the drag visuals.
+    let best = null;
+    let bestDist = Infinity;
+    for (const faceEdges of currentSkeleton.faces) {
+      const vertexIndices = new Set();
+      const segments = [];
+      let inPlane = true;
+      for (const ei of faceEdges) {
+        const [vi, vj] = currentSkeleton.edges[ei];
         const a = currentSkeleton.vertices[vi];
         const b = currentSkeleton.vertices[vj];
-        if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) continue;
-        const au = Math.round(a[ua]);
-        const av = Math.round(a[ub]);
-        const bu = Math.round(b[ua]);
-        const bv = Math.round(b[ub]);
-        // Walk the (axis-aligned) edge one unit at a time.
-        const stepU = Math.sign(bu - au);
-        const stepV = Math.sign(bv - av);
-        let cu = au;
-        let cv = av;
-        while (cu !== bu || cv !== bv) {
-          walls.add(segKey(cu, cv, cu + stepU, cv + stepV));
-          cu += stepU;
-          cv += stepV;
+        if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) {
+          inPlane = false;
+          break;
         }
+        vertexIndices.add(vi);
+        vertexIndices.add(vj);
+        segments.push([Math.round(a[ua]), Math.round(a[ub]), Math.round(b[ua]), Math.round(b[ub])]);
       }
-      for (const p of currentSkeleton.vertices) {
-        if (Math.round(p[axis]) === coord) planeVertices.add(`${Math.round(p[ua])},${Math.round(p[ub])}`);
+      if (!inPlane || !segments.length) continue;
+      // Distance from the click point to this cycle = its nearest edge.
+      let dist = Infinity;
+      for (const [au, av, bu, bv] of segments) {
+        dist = Math.min(dist, pointSegDist2(hu, hv, au, av, bu, bv));
       }
-      for (const faceEdges of currentSkeleton.faces) {
-        const vertexIndices = new Set();
-        const segments = [];
-        let inPlane = true;
-        for (const ei of faceEdges) {
-          const [vi, vj] = currentSkeleton.edges[ei];
-          const a = currentSkeleton.vertices[vi];
-          const b = currentSkeleton.vertices[vj];
-          if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) {
-            inPlane = false;
-            break;
-          }
-          vertexIndices.add(vi);
-          vertexIndices.add(vj);
-          segments.push([Math.round(a[ua]), Math.round(a[ub]), Math.round(b[ua]), Math.round(b[ub])]);
-        }
-        if (!inPlane || !segments.length) continue;
-        const faceIdx = planeFaces.length;
-        planeFaces.push({ vertexIndices: [...vertexIndices], segments });
-        for (const vk of vertexIndices) {
-          const p = currentSkeleton.vertices[vk];
-          faceAtVertex.set(`${Math.round(p[ua])},${Math.round(p[ub])}`, faceIdx);
-        }
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { coord, vertexIndices: [...vertexIndices], segments };
       }
     }
 
-    // Is there a unit wall between corner points (au,av) and (bu,bv)?
-    const isWall = (au, av, bu, bv) => walls.has(segKey(au, av, bu, bv));
-
-    // Unit wall segment separating square (u,v) from its (du,dv) edge-neighbour.
-    const sharedWall = (u, v, du, dv) => {
-      if (du === 1) return isWall(u + 1, v, u + 1, v + 1);
-      if (du === -1) return isWall(u, v, u, v + 1);
-      if (dv === 1) return isWall(u, v + 1, u + 1, v + 1);
-      return isWall(u, v, u + 1, v);
-    };
-
-    const filled = new Set(); // instance ids visited (never retraced across jumps)
-    const jumpQueue = []; // seed square ids scheduled by corner-jumps
-    let foundFace = -1; // planeFaces index once a vertex is reached
-
-    // Return the in-plane face cycle through corner (cu,cv), if it's a vertex.
-    const faceAtCorner = (cu, cv) => faceAtVertex.get(`${cu},${cv}`);
-
-    // INNER LOOP: bounded edge-adjacency flood-fill of ONE region from a seed.
-    // Stops the whole search as soon as it reaches an in-plane skeleton VERTEX,
-    // which pins the containing face — that's all the commit and visuals need.
-    // Otherwise spreads across wall-free edges and SCHEDULES corner-jumps
-    // (diagonals across NON-vertex corners, where the hop passes two walls at
-    // once — legal — versus a vertex, where it would cross a single wall).
-    const fillRegion = (seedId) => {
-      const stack = [seedId];
-      filled.add(seedId);
-      while (stack.length) {
-        const id = stack.pop();
-        const [u, v] = uvOf.get(id);
-        // A skeleton vertex at any of this square's 4 corners identifies the face.
-        for (const [cu, cv] of [[u, v], [u + 1, v], [u, v + 1], [u + 1, v + 1]]) {
-          const f = faceAtCorner(cu, cv);
-          if (f !== undefined) {
-            foundFace = f;
-            return;
-          }
-        }
-        for (const [du, dv] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-          const nb = squareId.get(`${u + du},${v + dv}`);
-          if (nb === undefined || filled.has(nb)) continue;
-          if (sharedWall(u, v, du, dv)) continue;
-          filled.add(nb);
-          stack.push(nb);
-        }
-        for (const [du, dv] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
-          const cu = du === 1 ? u + 1 : u;
-          const cv = dv === 1 ? v + 1 : v;
-          if (planeVertices.has(`${cu},${cv}`)) continue; // never jump over a vertex
-          const nb = squareId.get(`${u + du},${v + dv}`);
-          if (nb !== undefined && !filled.has(nb)) jumpQueue.push(nb);
-        }
-      }
-    };
-
-    // OUTER LOOP: fill regions, draining scheduled corner-jumps, until a face is
-    // identified. Case A (a region reaches a vertex) pins the face; case B (a
-    // region exhausts as a rectangle without one — e.g. a crossing's arm) leads
-    // to a corner-jump into the next region.
-    fillRegion(startId);
-    while (foundFace < 0 && jumpQueue.length) {
-      const seed = jumpQueue.pop();
-      if (!filled.has(seed)) fillRegion(seed);
-    }
-
-    if (foundFace < 0) return null; // no bounding face found (shouldn't happen)
-    const { vertexIndices, segments } = planeFaces[foundFace];
-    return { coord, vertexIndices, segments };
+    return best; // null if no in-plane bounding face was found (shouldn't happen)
   }
 
   // Edit-axis integer values that hold NO boundary face orthogonal to the edit
@@ -1455,8 +1363,8 @@ async function main() {
     return { plane: best, dist: bestDist };
   }
 
-  function startDrag(axis, hitId) {
-    const face = connectedFace(axis, hitId);
+  function startDrag(axis, hitId, hitPoint) {
+    const face = connectedFace(axis, hitId, hitPoint);
     if (!face) return false; // not a grabbable face: let the gesture rotate the camera
     // Candidate destination planes, then discard any that would drive a dragged
     // vertex past a collinear neighbor (overlapping the neighboring edge).
@@ -1576,7 +1484,7 @@ async function main() {
       const hit = getIntersection(event.clientX, event.clientY)[0];
       if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
         const axis = cubeFaceMeshes.indexOf(hit.object);
-        if (axis !== -1 && startDrag(axis, hit.instanceId)) {
+        if (axis !== -1 && startDrag(axis, hit.instanceId, hit.point)) {
           hoverOutline.visible = false;
           event.preventDefault();
         }
