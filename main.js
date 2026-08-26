@@ -528,7 +528,8 @@ async function main() {
     // [au,av,bu,bv] segments for the drag visuals.
     let best = null;
     let bestDist = Infinity;
-    for (const faceEdges of currentSkeleton.faces) {
+    for (let faceIdx = 0; faceIdx < currentSkeleton.faces.length; faceIdx++) {
+      const faceEdges = currentSkeleton.faces[faceIdx];
       const vertexIndices = new Set();
       const segments = [];
       let inPlane = true;
@@ -552,7 +553,10 @@ async function main() {
       }
       if (dist < bestDist) {
         bestDist = dist;
-        best = { coord, vertexIndices: [...vertexIndices], segments };
+        // `key` names this face independently of index order, so the commit can
+        // re-resolve it against a freshly computed skeleton instead of trusting
+        // indices captured when the drag began.
+        best = { coord, key: currentSkeleton.faceKeys[faceIdx], vertexIndices: [...vertexIndices], segments };
       }
     }
 
@@ -659,24 +663,28 @@ async function main() {
   const isFaceVisibility = (v) =>
     Array.isArray(v) && v.length === 3 && v.every((s) => s === FACE_SOLID || s === FACE_TRANSLUCENT || s === FACE_HIDDEN);
 
-  // The autosave-to-localStorage path and the file-save paths share this
-  // serializer, but the brink skeleton is included ONLY in saved files
-  // (includeSkeleton = true) — never in the autosave, which stays lean and
-  // always re-derives the skeleton from `positions` on load. The saved
-  // skeleton is the concrete form { vertices, edges, faces }; the abstract
-  // form (no coordinates) is derivable from it when needed.
-  function currentStateJSON(includeSkeleton = false) {
+  // What we persist is an abstract GRAPH (edges + faces) together with a
+  // DRAWING of it (vertex coordinates) — the mathematically meaningful
+  // content. Cubes are a derivation of the drawing and are NOT saved: for the
+  // Klein quartic that takes the file from 2106KB to 53KB, and the cubes are
+  // recovered exactly on load.
+  //
+  // This shape is shared by the autosave and the file-save paths. Autosave
+  // previously wrote `positions` on every edit, which for large models meant
+  // rewriting hundreds of KB per cube; it now writes the drawing instead.
+  function currentStateJSON() {
+    // Persist only the graph and its drawing. The identity fields that
+    // computeBrinkSkeleton also returns (ids, keys, lookup Maps) are derived —
+    // and Maps would serialize to `{}` — so they stay out of the file.
+    const { vertices, edges, faces } = computeBrinkSkeleton(positions);
     const state = {
-      positions,
+      skeleton: { vertices, edges, faces },
       faceVisibility,
       camera: {
         position: camera.position.toArray(),
         target: controls.target.toArray(),
       },
     };
-    if (includeSkeleton) {
-      state.skeleton = computeBrinkSkeleton(positions);
-    }
     return JSON.stringify(state, null, 2);
   }
 
@@ -786,7 +794,7 @@ async function main() {
 
   async function writeToFileHandle(handle) {
     const writable = await handle.createWritable();
-    await writable.write(currentStateJSON(true));
+    await writable.write(currentStateJSON());
     await writable.close();
   }
 
@@ -805,7 +813,7 @@ async function main() {
       return;
     }
 
-    const blob = new Blob([currentStateJSON(true)], { type: 'application/json' });
+    const blob = new Blob([currentStateJSON()], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -852,18 +860,20 @@ async function main() {
     saveToLocalStorage();
   }
 
-  // Three load gestures over ONE file format, differing only in how the
-  // cubes are derived:
-  //   'cubes'    — take the file's positions directly (skeleton re-derived).
-  //   'skeleton' — recover cubes from the file's concrete skeleton.
-  //   'abstract' — discard the skeleton's coordinates, re-realize them, then
-  //                recover cubes from the realized skeleton.
-  // In every case the applied `positions` are the sole source of truth: the
-  // app re-derives the brink skeleton from them on load (updateBrinkSkeleton
-  // via addVoxel), so any loaded/realized skeleton is used only transiently
-  // to compute the cubes and is then discarded. A round-trip where the
-  // re-derived skeleton matches the loaded one is the built-in correctness
-  // check.
+  // A saved file holds an abstract GRAPH (edges + faces) and, optionally, a
+  // DRAWING of it (vertex coordinates). Cubes are a derivation, not content,
+  // so a plain open resolves on what the file actually carries:
+  //   graph + drawing -> fill cubes from the drawing (authoritative even when
+  //                      legacy `positions` are also present)
+  //   graph, no drawing -> realize coordinates, then fill
+  //   positions only    -> legacy file: load the cubes directly
+  // The explicit 'skeleton' and 'abstract' gestures remain as OVERRIDES —
+  // loading a drawn graph *as* abstract, to re-realize its coordinates, is a
+  // meaningful thing to ask for.
+  //
+  // Whatever the route, the applied `positions` become the in-memory cube
+  // cache backing rendering, picking, and export; the app re-derives the
+  // skeleton from them on load.
   const dropOutOfBounds = (cubes) => {
     const kept = cubes.filter((c) => inBounds(c.x, c.y, c.z));
     if (kept.length !== cubes.length) {
@@ -872,11 +882,24 @@ async function main() {
     return kept;
   };
 
+  // Does this state carry a usable drawing (a graph with real coordinates)?
+  const hasDrawing = (state) => Boolean(state.skeleton && state.skeleton.vertices.length);
+
   // Synchronous cube derivation for the 'cubes' and 'skeleton' gestures (both
   // fast). The 'abstract' gesture is handled separately via a worker because
   // its coordinate realization can be slow — see realizeAbstract().
   function derivePositionsSync(state, interpretation) {
-    if (interpretation === 'cubes') return state.positions;
+    // A plain open prefers the drawing over any stored cubes: the drawing is
+    // the content, the cubes a derivation of it. Old files carry both.
+    if (interpretation === 'cubes') {
+      if (!hasDrawing(state)) return state.positions;
+      try {
+        return dropOutOfBounds(fillCubesFromSkeleton(state.skeleton));
+      } catch (error) {
+        console.error('Load failed while filling cubes from the drawing:', error);
+        return state.positions; // fall back to stored cubes if present
+      }
+    }
     if (!state.skeleton) {
       console.error(`Load failed: file has no skeleton to load as "${interpretation}".`);
       return null;
@@ -951,6 +974,13 @@ async function main() {
   }
 
   async function applyLoadedFile(state, interpretation) {
+    // A plain open of a file that carries a graph but NO drawing has to
+    // realize coordinates first — the same work the explicit 'abstract'
+    // gesture does, so route it there rather than failing for want of cubes.
+    if (interpretation === 'cubes' && !hasDrawing(state) && state.skeleton?.vertexCount > 0 && !state.positions.length) {
+      interpretation = 'abstract';
+    }
+
     if (interpretation === 'abstract') {
       if (!state.skeleton) {
         console.error('Load failed: file has no skeleton to load as "abstract".');
@@ -1207,8 +1237,17 @@ async function main() {
   // Restore the initial voxel set in ONE batch (raw adds, then a single
   // recompute/render) — a per-cube addVoxel loop here is O(N²) and rebuilds
   // every InstancedMesh per cube, hanging startup on large saved models.
-  if (saved?.positions?.length) {
-    for (const { x, y, z } of saved.positions) addVoxelRaw(x, y, z);
+  // Autosaves now carry the drawing rather than the cubes, but an autosave
+  // written by an older build (positions only) must still restore — so accept
+  // either shape, preferring the drawing.
+  const restored = saved
+    ? hasDrawing(saved)
+      ? dropOutOfBounds(fillCubesFromSkeleton(saved.skeleton))
+      : saved.positions
+    : null;
+
+  if (restored?.length) {
+    for (const { x, y, z } of restored) addVoxelRaw(x, y, z);
   } else {
     addVoxelRaw(0, 0, 0);
   }
@@ -1428,6 +1467,18 @@ async function main() {
     // the modified skeleton — exactly the "load skeleton" path
     // (fillCubesFromSkeleton). Copy the captured skeleton so the live one isn't
     // mutated before the re-fill.
+    //
+    // Re-resolve the face by key against the skeleton the drag captured. The
+    // key names the face by its edge cycle rather than by position in the face
+    // array, so if anything recomputed the skeleton mid-gesture we move the
+    // face we grabbed or nothing at all — never whichever face inherited its
+    // index.
+    const faceIdx = skeleton.byFaceKey?.get(face.key);
+    if (faceIdx === undefined) {
+      console.warn('Face drag: the grabbed face is no longer present; ignoring the drag.');
+      updateBrinkSkeleton(); // resync render to the unchanged positions
+      return;
+    }
     const moved = new Set(face.vertexIndices);
     const vertices = skeleton.vertices.map((p, vi) => {
       if (!moved.has(vi)) return [p[0], p[1], p[2]];

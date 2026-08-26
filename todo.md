@@ -5,6 +5,7 @@
 - add undo/redo support
 - better topology metrics
 - unambiguous face drag control
+- change face drag to plane swap:
 
 ## nice to have
 
@@ -13,7 +14,6 @@
 - change rendering controls:
   - modifier keys for mouse
   - table for controls (and touch)
-- change face drag to plane swap:
 - change mode controls
   - modifier keys for mouse
   - mode selector for touch

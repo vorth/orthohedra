@@ -41,6 +41,33 @@ function pointKey(p) {
 }
 
 /**
+ * Canonical key for a cycle of element keys. The cycle walk may start at any
+ * element and run in either direction, so a face's key must be invariant to
+ * both: rotate so the lowest-sorting key comes first, then take whichever of
+ * the two directions gives the lexicographically smaller sequence.
+ * @param {string[]} keys - the cycle's element keys, in cycle order
+ * @returns {string}
+ */
+function canonicalCycleKey(keys) {
+  const n = keys.length;
+  if (n === 0) return '';
+  let lowest = keys[0];
+  for (const k of keys) if (k < lowest) lowest = k;
+
+  let best = null;
+  for (const seq of [keys, [...keys].reverse()]) {
+    for (let start = 0; start < n; start++) {
+      if (seq[start] !== lowest) continue;
+      const rotated = [];
+      for (let i = 0; i < n; i++) rotated.push(seq[(start + i) % n]);
+      const candidate = rotated.join(',');
+      if (best === null || candidate < best) best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
  * Compute the boundary (non-internal) unit faces of a cube assembly: one
  * entry per cube face that does not directly adjoin another cube (i.e.
  * every face except those sandwiched between two present cubes).
@@ -99,6 +126,15 @@ export function computeBrinkSkeleton(cubes) {
       vertexPoints.push(k.split(',').map(Number));
     }
   }
+
+  // Sort lexicographically by (x, y, z). `cornerCounts` is keyed by insertion
+  // order over `cubes`, which callers reorder freely (removeVoxel swap-pops),
+  // so without this the index assigned to a vertex depends on the history of
+  // the cube array rather than on the vertex set itself. Sorting makes indexing
+  // a deterministic function of the SET, so two equal cube assemblies always
+  // produce identically indexed skeletons — which is what lets a Gb recompute
+  // match its new vertices back to existing identities reproducibly.
+  vertexPoints.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
 
   // --- Dimension 1: edges. Group extremal vertices by the line they sit
   // on (the 2 fixed coordinates), sort each line by the varying
@@ -188,7 +224,39 @@ export function computeBrinkSkeleton(cubes) {
     }
   }
 
-  return { vertices: vertexPoints.map((p) => [p[0], p[1], p[2]]), edges, faces };
+  // --- Element identity. -----------------------------------------------
+  // Identity belongs to the GRAPH, which has no coordinates, so it must not be
+  // derived from geometry: a graph-preserving edit moves vertices, and keys
+  // derived from coordinates would be destroyed (or, in a plane swap, silently
+  // exchanged) by exactly the operations that are supposed to preserve them.
+  //
+  // Here the ids are the freshly assigned vertex indices, which is correct for
+  // a skeleton computed from cubes: this is the graph-BREAKING path, where the
+  // cubes are ground truth and the graph is being (re)derived. The caller is
+  // responsible for matching these back to previously issued ids — by
+  // coordinate, legitimate precisely because coordinates are ground truth here.
+  //
+  // Edges are keyed by their endpoint ids; faces by their cycle of EDGE keys,
+  // matching how faces are represented and persisted everywhere else (arrays of
+  // edge indices), so nothing has to translate between vertex- and edge-shaped
+  // notions of a face.
+  const vertexIds = vertexPoints.map((_, vi) => vi);
+  const edgeKeys = edges.map(([v1, v2]) => (v1 < v2 ? `${v1}|${v2}` : `${v2}|${v1}`));
+  const faceKeys = faces.map((cycle) => canonicalCycleKey(cycle.map((ei) => edgeKeys[ei])));
+
+  const byEdgeKey = new Map(edgeKeys.map((k, i) => [k, i]));
+  const byFaceKey = new Map(faceKeys.map((k, i) => [k, i]));
+
+  return {
+    vertices: vertexPoints.map((p) => [p[0], p[1], p[2]]),
+    edges,
+    faces,
+    vertexIds,
+    edgeKeys,
+    faceKeys,
+    byEdgeKey,
+    byFaceKey,
+  };
 }
 
 export function logBrinkSkeleton(skeleton) {
