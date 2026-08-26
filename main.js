@@ -645,6 +645,42 @@ async function main() {
     return { lo, hi, impeders };
   }
 
+  // A GRAPH-PRESERVING edit: move the named faces to `plane` along `axis` by
+  // rewriting only their vertices' coordinates. The graph itself — edges,
+  // faces, and the identity of every element — is carried forward BY REFERENCE,
+  // because a face move changes the drawing and nothing else.
+  //
+  // This is what makes the keys durable. Re-deriving the graph from the filled
+  // cubes would renumber the vertices (computeBrinkSkeleton sorts them
+  // lexicographically, and the moved ones sort differently), invalidating every
+  // key even though the graph is identical. Carrying it forward leaves each
+  // index exactly where it was.
+  //
+  // Returns null if the move would place two vertices at the same point: that
+  // is a graph-BREAKING merge, not something this path may quietly perform.
+  function applyGraphDrawingEdit(skeleton, faceKeys, axis, plane) {
+    const moved = new Set();
+    for (const key of faceKeys) {
+      const faceIdx = skeleton.byFaceKey.get(key);
+      if (faceIdx === undefined) return null; // names a face this skeleton lacks
+      for (const ei of skeleton.faces[faceIdx]) {
+        for (const vi of skeleton.edges[ei]) moved.add(vi);
+      }
+    }
+
+    const vertices = skeleton.vertices.map((p, vi) => {
+      if (!moved.has(vi)) return [p[0], p[1], p[2]];
+      const q = [p[0], p[1], p[2]];
+      q[axis] = plane;
+      return q;
+    });
+
+    const distinct = new Set(vertices.map((p) => `${p[0]},${p[1]},${p[2]}`));
+    if (distinct.size !== vertices.length) return null; // would fuse vertices
+
+    return { ...skeleton, vertices };
+  }
+
   const occupied = new Map();
   const positions = [];
 
@@ -1104,8 +1140,12 @@ async function main() {
     return true;
   }
 
-  function updateBrinkSkeleton() {
-    const skeleton = computeBrinkSkeleton(positions);
+  // Adopt an ALREADY-KNOWN skeleton as the current one: render it, restate the
+  // topology readout, rebuild the cube-face geometry, and persist. Deliberately
+  // does NOT derive the graph — a graph-preserving edit already holds the
+  // graph, and re-deriving it would be both wasteful and lossy (see
+  // applyGraphDrawingEdit).
+  function adoptSkeleton(skeleton) {
     currentSkeleton = skeleton;
     // logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
@@ -1118,6 +1158,13 @@ async function main() {
       `Orientable: ${bipartite ? 'yes' : 'no'}`;
     renderBoundaryCubeFaces(positions);
     saveToLocalStorage();
+  }
+
+  // The graph-BREAKING path: the cubes are ground truth, so derive the graph
+  // from them and adopt the result. Every voxel add/remove, reset, and load
+  // goes through here.
+  function updateBrinkSkeleton() {
+    adoptSkeleton(computeBrinkSkeleton(positions));
   }
 
   function reset() {
@@ -1432,7 +1479,7 @@ async function main() {
     drag = {
       axis,
       face,
-      skeleton: currentSkeleton, // captured so face.vertexIndices stay valid
+      skeleton: currentSkeleton, // the graph the drag edits, resolved by face key at commit
       planes: values,
       linePoint,
       dragValue: face.coord,
@@ -1462,41 +1509,29 @@ async function main() {
     if (plane === null || dist > SNAP_THRESHOLD) return; // not near a plane: cancel
     if (plane === face.coord) return;
 
-    // Move the dragged face to the target plane by shifting ONLY its skeleton
-    // vertices' edit-axis coordinate, then recompute the whole cube array from
-    // the modified skeleton — exactly the "load skeleton" path
-    // (fillCubesFromSkeleton). Copy the captured skeleton so the live one isn't
-    // mutated before the re-fill.
-    //
-    // Re-resolve the face by key against the skeleton the drag captured. The
-    // key names the face by its edge cycle rather than by position in the face
-    // array, so if anything recomputed the skeleton mid-gesture we move the
-    // face we grabbed or nothing at all — never whichever face inherited its
-    // index.
-    const faceIdx = skeleton.byFaceKey?.get(face.key);
-    if (faceIdx === undefined) {
-      console.warn('Face drag: the grabbed face is no longer present; ignoring the drag.');
-      updateBrinkSkeleton(); // resync render to the unchanged positions
+    // A graph-preserving edit: shift the dragged face's vertices to the target
+    // plane, keeping the graph itself. The face is named by KEY — by its edge
+    // cycle rather than by position in the face array — so we move the face we
+    // grabbed or nothing at all, never whichever face inherited its index.
+    const modifiedSkeleton = applyGraphDrawingEdit(skeleton, [face.key], axis, plane);
+    if (!modifiedSkeleton) {
+      console.warn('Face drag: the move is not graph-preserving; ignoring the drag.');
+      adoptSkeleton(skeleton); // resync render to the unchanged skeleton
       return;
     }
-    const moved = new Set(face.vertexIndices);
-    const vertices = skeleton.vertices.map((p, vi) => {
-      if (!moved.has(vi)) return [p[0], p[1], p[2]];
-      const q = [p[0], p[1], p[2]];
-      q[axis] = plane;
-      return q;
-    });
-    const modifiedSkeleton = { vertices, edges: skeleton.edges, faces: skeleton.faces };
 
     try {
+      // Cubes are derived purely to render, pick, and export — they are not
+      // consulted to rebuild the graph, so `adoptSkeleton` (not
+      // `updateBrinkSkeleton`) takes the graph we already hold.
       const cubes = dropOutOfBounds(fillCubesFromSkeleton(modifiedSkeleton));
       for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
       for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
-      updateBrinkSkeleton();
+      adoptSkeleton(modifiedSkeleton);
       updateStatus(mode);
     } catch (error) {
       console.error('Face drag failed while re-filling from skeleton:', error);
-      updateBrinkSkeleton(); // resync render to the unchanged positions
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
     }
   }
 

@@ -240,6 +240,14 @@ export function computeBrinkSkeleton(cubes) {
   // matching how faces are represented and persisted everywhere else (arrays of
   // edge indices), so nothing has to translate between vertex- and edge-shaped
   // notions of a face.
+  //
+  // Keys are durable IDENTITY, not a canonical function of the drawing. A
+  // graph-preserving edit carries them forward unchanged, so they keep naming
+  // the same elements across a session's edits — but they are not what this
+  // function would assign to the edited drawing, since the lexicographic sort
+  // above would number the moved vertices differently. Two skeletons of the
+  // same shape may therefore carry different keys: use keys to track elements
+  // through history, and compare COORDINATES to ask whether two graphs match.
   const vertexIds = vertexPoints.map((_, vi) => vi);
   const edgeKeys = edges.map(([v1, v2]) => (v1 < v2 ? `${v1}|${v2}` : `${v2}|${v1}`));
   const faceKeys = faces.map((cycle) => canonicalCycleKey(cycle.map((ei) => edgeKeys[ei])));
