@@ -29,6 +29,8 @@ const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
 const resetBtn = document.getElementById('resetBtn');
 const moveBtn = document.getElementById('moveBtn');
+const undoBtn = document.getElementById('undoBtn');
+const redoBtn = document.getElementById('redoBtn');
 const saveBtn = document.getElementById('saveBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
 const loadBtn = document.getElementById('loadBtn');
@@ -684,6 +686,25 @@ async function main() {
   const occupied = new Map();
   const positions = [];
 
+  // --- Undo/redo -----------------------------------------------------------
+  // Each entry snapshots the Graph Drawing, which IS the model state. Cubes are
+  // left out because they are derived — a restore refills them from the drawing
+  // (~49ms even for the 37k-cube Klein quartic, imperceptible for an undo).
+  // Face visibility and camera are left out because they are rendering choices,
+  // not model state: an undo should revert your edit without disturbing how you
+  // are looking at it.
+  //
+  // Snapshots rather than per-operation inverses: the drawing is small (3.9 KB
+  // for the largest design in designs/, so even hundreds of entries cost a
+  // couple of MB), and an inverse that is subtly wrong corrupts state silently,
+  // which a snapshot cannot do. History is unbounded, and one stack carries
+  // both graph-preserving and graph-breaking edits.
+  //
+  // No deep copy is needed: every producer of a skeleton (computeBrinkSkeleton,
+  // applyGraphDrawingEdit) returns a fresh object with a fresh vertices array,
+  // and nothing mutates a skeleton in place.
+  const history = { entries: [], index: -1 }; // entries[index] is the current state
+
   const STORAGE_KEY = 'cubes-editor:state';
   // Old render-mode strings, migrated to a `faceVisibility` tri-state array on
   // load. "normal" -> all solid; each "no-X" made the faces IN A PLANE
@@ -881,7 +902,7 @@ async function main() {
     // 37k-cube realized skeleton).
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
-    updateBrinkSkeleton();
+    updateBrinkSkeleton({ record: true, label: 'Load' });
 
     faceVisibility.splice(0, 3, ...state.faceVisibility);
     applyFaceVisibility();
@@ -1140,12 +1161,66 @@ async function main() {
     return true;
   }
 
+  // Push a new state, discarding any redo tail: editing after an undo forks
+  // history, and the abandoned branch is gone.
+  function recordHistory(skeleton, label) {
+    history.entries.length = history.index + 1;
+    history.entries.push({ label, skeleton });
+    history.index = history.entries.length - 1;
+    updateHistoryButtons();
+  }
+
+  const canUndo = () => history.index > 0;
+  const canRedo = () => history.index < history.entries.length - 1;
+
+  function updateHistoryButtons() {
+    undoBtn.disabled = !canUndo();
+    redoBtn.disabled = !canRedo();
+    undoBtn.title = canUndo() ? `Undo ${history.entries[history.index].label}` : 'Nothing to undo';
+    redoBtn.title = canRedo() ? `Redo ${history.entries[history.index + 1].label}` : 'Nothing to redo';
+  }
+
+  // Restore a recorded state. Cubes are refilled from the drawing rather than
+  // stored, using the raw primitives plus a single adoptSkeleton — a per-cube
+  // addVoxel loop here would be O(N²) and rebuild every InstancedMesh per cube.
+  function restoreHistory(i) {
+    const { skeleton } = history.entries[i];
+    history.index = i;
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(skeleton));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+    } catch (error) {
+      console.error('Undo/redo failed while refilling cubes from the drawing:', error);
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
+      return;
+    }
+    // adoptSkeleton renders the cube geometry from `positions`, so the refill
+    // above must already have happened. Not recorded: restoring is not an edit.
+    adoptSkeleton(skeleton);
+    updateHistoryButtons();
+    updateStatus(mode);
+  }
+
+  function undo() {
+    if (canUndo()) restoreHistory(history.index - 1);
+  }
+
+  function redo() {
+    if (canRedo()) restoreHistory(history.index + 1);
+  }
+
   // Adopt an ALREADY-KNOWN skeleton as the current one: render it, restate the
   // topology readout, rebuild the cube-face geometry, and persist. Deliberately
   // does NOT derive the graph — a graph-preserving edit already holds the
   // graph, and re-deriving it would be both wasteful and lossy (see
   // applyGraphDrawingEdit).
-  function adoptSkeleton(skeleton) {
+  //
+  // `record` is explicit rather than inferred: this function is also called for
+  // non-edits — resyncing the render after a failed drag, and seeding the
+  // initial state — which must not become undoable steps.
+  function adoptSkeleton(skeleton, { record = false, label = '' } = {}) {
+    if (record) recordHistory(skeleton, label);
     currentSkeleton = skeleton;
     // logBrinkSkeleton(skeleton);
     renderBrinkSkeleton(skeleton);
@@ -1163,8 +1238,8 @@ async function main() {
   // The graph-BREAKING path: the cubes are ground truth, so derive the graph
   // from them and adopt the result. Every voxel add/remove, reset, and load
   // goes through here.
-  function updateBrinkSkeleton() {
-    adoptSkeleton(computeBrinkSkeleton(positions));
+  function updateBrinkSkeleton(options) {
+    adoptSkeleton(computeBrinkSkeleton(positions), options);
   }
 
   function reset() {
@@ -1173,7 +1248,7 @@ async function main() {
     // which locks up on large models (e.g. a 37k-cube loaded skeleton).
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     addVoxelRaw(0, 0, 0);
-    updateBrinkSkeleton();
+    updateBrinkSkeleton({ record: true, label: 'Reset' });
     updateStatus(mode);
   }
 
@@ -1185,7 +1260,7 @@ async function main() {
     positions.push(pos);
     occupied.set(key(x, y, z), idx);
 
-    updateBrinkSkeleton();
+    updateBrinkSkeleton({ record: true, label: 'Add cube' });
     return true;
   }
 
@@ -1204,7 +1279,7 @@ async function main() {
 
     positions.pop();
     occupied.delete(removeKey);
-    updateBrinkSkeleton();
+    updateBrinkSkeleton({ record: true, label: 'Remove cube' });
     return true;
   }
 
@@ -1298,7 +1373,9 @@ async function main() {
   } else {
     addVoxelRaw(0, 0, 0);
   }
-  updateBrinkSkeleton();
+  // Seed history with the starting state so the first undo has somewhere to
+  // return to. Recorded as the base entry, not as an edit the user made.
+  updateBrinkSkeleton({ record: true, label: 'Initial state' });
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
@@ -1527,7 +1604,7 @@ async function main() {
       const cubes = dropOutOfBounds(fillCubesFromSkeleton(modifiedSkeleton));
       for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
       for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
-      adoptSkeleton(modifiedSkeleton);
+      adoptSkeleton(modifiedSkeleton, { record: true, label: 'Move face' });
       updateStatus(mode);
     } catch (error) {
       console.error('Face drag failed while re-filling from skeleton:', error);
@@ -1552,12 +1629,31 @@ async function main() {
   destroyBtn.addEventListener('click', () => setMode('destroy'));
   resetBtn.addEventListener('click', () => reset());
   moveBtn.addEventListener('click', () => toggleMoveMode());
+  undoBtn.addEventListener('click', () => undo());
+  redoBtn.addEventListener('click', () => redo());
 
   saveBtn.addEventListener('click', () => save());
   saveAsBtn.addEventListener('click', () => saveAs());
   loadBtn.addEventListener('click', () => load('cubes'));
   loadAbstractBtn.addEventListener('click', () => load('abstract'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
+
+  // Cmd/Ctrl+Z to undo, Cmd/Ctrl+Shift+Z or Ctrl+Y to redo. Suspended while a
+  // realization is running or a drag is in flight, matching the edit guards.
+  window.addEventListener('keydown', (event) => {
+    if (busy || drag || trapped) return;
+    const accel = event.metaKey || event.ctrlKey;
+    if (!accel) return;
+    const key = event.key.toLowerCase();
+    if (key === 'z') {
+      event.preventDefault();
+      if (event.shiftKey) redo();
+      else undo();
+    } else if (key === 'y') {
+      event.preventDefault();
+      redo();
+    }
+  });
 
   renderer.domElement.addEventListener('pointerdown', (event) => {
     downX = event.clientX;

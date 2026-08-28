@@ -69,8 +69,13 @@ body {
   transition: transform 0.1s ease, background-color 0.15s ease, border-color 0.15s ease;
 }
 
-.mode-btn:hover {
+.mode-btn:hover:not(:disabled) {
   transform: translateY(-1px);
+}
+
+.mode-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .mode-btn.active[data-mode="build"] {
@@ -86,6 +91,12 @@ body {
 #moveBtn.active {
   border-color: #b98bff;
   background: rgba(185, 139, 255, 0.2);
+}
+
+.edit-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .file-actions {
