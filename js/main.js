@@ -5,7 +5,7 @@ import { LineMaterial } from "https://esm.sh/three@0.172.0/examples/jsm/lines/Li
 import { LineSegmentsGeometry } from "https://esm.sh/three@0.172.0/examples/jsm/lines/LineSegmentsGeometry.js";
 import { computeBrinkSkeleton, computeBoundaryCubeFaces, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
-import { MIN, MAX, AXIS_COLORS, FACE_COLORS, FACE_SOLID, FACE_TRANSLUCENT, FACE_HIDDEN, STORAGE_KEY } from "./constants.js";
+import { MIN, MAX, AXIS_COLORS, FACE_COLORS, FACE_SOLID, FACE_TRANSLUCENT, FACE_HIDDEN, inBounds } from "./constants.js";
 import {
   inPlaneAxes,
   pointSegDist2,
@@ -17,6 +17,12 @@ import {
   applyGraphDrawingEdit,
 } from "./faceGeometry.js";
 import { createRealizer } from "./realization.js";
+import {
+  saveToLocalStorage as writeLocalStorage,
+  loadFromLocalStorage,
+  createFileStore,
+  loadFromDesignParam,
+} from "./persistence.js";
 
 // Initial per-mesh instance capacity; ensureInstanceCapacity() grows it (to the
 // next power of two) whenever a render needs more.
@@ -556,190 +562,31 @@ async function main() {
   // and nothing mutates a skeleton in place.
   const history = { entries: [], index: -1 }; // entries[index] is the current state
 
-  // Old render-mode strings, migrated to a `faceVisibility` tri-state array on
-  // load. "normal" -> all solid; each "no-X" made the faces IN A PLANE
-  // CONTAINING that color translucent (the other two axes), leaving that axis
-  // solid — reproduced here as [X,Y,Z] translucency.
-  const LEGACY_RENDER_MODE_VISIBILITY = {
-    normal: [FACE_SOLID, FACE_SOLID, FACE_SOLID],
-    'no-red': [FACE_SOLID, FACE_TRANSLUCENT, FACE_TRANSLUCENT],
-    'no-yellow': [FACE_TRANSLUCENT, FACE_SOLID, FACE_TRANSLUCENT],
-    'no-blue': [FACE_TRANSLUCENT, FACE_TRANSLUCENT, FACE_SOLID],
-  };
-
-  const isFaceVisibility = (v) =>
-    Array.isArray(v) && v.length === 3 && v.every((s) => s === FACE_SOLID || s === FACE_TRANSLUCENT || s === FACE_HIDDEN);
-
-  // What we persist is an abstract GRAPH (edges + faces) together with a
-  // DRAWING of it (vertex coordinates) — the mathematically meaningful
-  // content. Cubes are a derivation of the drawing and are NOT saved: for the
-  // Klein quartic that takes the file from 2106KB to 53KB, and the cubes are
-  // recovered exactly on load.
-  //
-  // This shape is shared by the autosave and the file-save paths. Autosave
-  // previously wrote `positions` on every edit, which for large models meant
-  // rewriting hundreds of KB per cube; it now writes the drawing instead.
-  function currentStateJSON() {
-    // Persist only the graph and its drawing. The identity fields that
-    // computeBrinkSkeleton also returns (ids, keys, lookup Maps) are derived —
-    // and Maps would serialize to `{}` — so they stay out of the file.
-    const { vertices, edges, faces } = computeBrinkSkeleton(positions);
-    const state = {
-      skeleton: { vertices, edges, faces },
+  // --- Persistence glue ----------------------------------------------------
+  // persistence.js owns the save FORMAT but knows nothing about this app's
+  // state, so everything it writes comes through here. `snapshot()` gathers the
+  // three things a save records; the skeleton is rebuilt from `positions`
+  // rather than read from `currentSkeleton` so an autosave always reflects the
+  // cubes, exactly as before the split.
+  function snapshot() {
+    return {
+      skeleton: computeBrinkSkeleton(positions),
       faceVisibility,
       camera: {
         position: camera.position.toArray(),
         target: controls.target.toArray(),
       },
     };
-    return JSON.stringify(state, null, 2);
-  }
-
-  function parseSavedState(raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return null;
-
-      const positions = Array.isArray(parsed.positions)
-        ? parsed.positions.filter(
-            (p) =>
-              p &&
-              Number.isInteger(p.x) &&
-              Number.isInteger(p.y) &&
-              Number.isInteger(p.z) &&
-              inBounds(p.x, p.y, p.z)
-          )
-        : [];
-
-      // Prefer the new tri-state array; fall back to migrating a legacy
-      // `renderMode` string; else default to all-solid.
-      const faceVis = isFaceVisibility(parsed.faceVisibility)
-        ? parsed.faceVisibility
-        : LEGACY_RENDER_MODE_VISIBILITY[parsed.renderMode] ?? [FACE_SOLID, FACE_SOLID, FACE_SOLID];
-
-      const isVector3Array = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
-      const cameraState =
-        parsed.camera && isVector3Array(parsed.camera.position) && isVector3Array(parsed.camera.target)
-          ? parsed.camera
-          : null;
-
-      // The skeleton is present only in saved files (not autosave). Validate
-      // its shape loosely — it is only consumed by the skeleton/abstract
-      // load gestures, which tolerate its absence by falling back gracefully.
-      //
-      // Two tiers of validity:
-      //   - CONCRETE: `vertices` is an array of [x,y,z] points. Usable by every
-      //     gesture (the 'skeleton' fill needs real coordinates).
-      //   - ABSTRACT-ONLY: valid edges/faces plus a vertex COUNT — from an
-      //     integer `numVertices`, or the length of a `vertices` array whose
-      //     contents we don't require to be coordinates. Usable only by the
-      //     'abstract' gesture, which re-realizes coordinates from the graph.
-      // We keep `vertices` (coordinates) when present and valid, else [];
-      // `vertexCount` always carries the count so the abstract path works even
-      // when coordinates are absent.
-      const skel = parsed.skeleton;
-      const edgesValid =
-        skel &&
-        Array.isArray(skel.edges) &&
-        skel.edges.every((e) => Array.isArray(e) && e.length === 2 && e.every(Number.isInteger));
-      const facesValid =
-        skel && Array.isArray(skel.faces) && skel.faces.every((f) => Array.isArray(f) && f.every(Number.isInteger));
-      const concreteVertices = skel && Array.isArray(skel.vertices) && skel.vertices.every(isVector3Array);
-      const vertexCount = Number.isInteger(skel?.numVertices)
-        ? skel.numVertices
-        : Array.isArray(skel?.vertices)
-          ? skel.vertices.length
-          : null;
-      let skeleton =
-        edgesValid && facesValid && Number.isInteger(vertexCount)
-          ? {
-              vertices: concreteVertices ? skel.vertices : [],
-              vertexCount,
-              edges: skel.edges,
-              faces: skel.faces,
-            }
-          : null;
-
-      // Migrate skeletons saved under the OLD convention (cube centers at
-      // integers => skeleton vertices at half-integers). Reinterpreting the
-      // old integer `positions` in place as least-corners shifts the model
-      // +0.5 in world space, so the matching skeleton is the old vertices
-      // shifted +0.5, which also makes them the integers the new pipeline
-      // expects. Detect the old form by any non-integer vertex coordinate.
-      // Only concrete skeletons carry coordinates to migrate.
-      if (skeleton && skeleton.vertices.some((v) => v.some((c) => !Number.isInteger(c)))) {
-        skeleton = {
-          vertices: skeleton.vertices.map((v) => [v[0] + 0.5, v[1] + 0.5, v[2] + 0.5]),
-          vertexCount: skeleton.vertexCount,
-          edges: skeleton.edges,
-          faces: skeleton.faces,
-        };
-      }
-
-      return { positions, faceVisibility: faceVis, camera: cameraState, skeleton };
-    } catch {
-      return null;
-    }
   }
 
   function saveToLocalStorage() {
-    localStorage.setItem(STORAGE_KEY, currentStateJSON());
+    writeLocalStorage(snapshot());
   }
 
-  function loadFromLocalStorage() {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? parseSavedState(raw) : null;
-  }
-
-  // File save/load: uses the File System Access API when available (so a
-  // plain "Save" after the first "Save As…"/"Load…" writes straight back
-  // to the same file without re-prompting); falls back to a download-link
-  // trigger and a hidden file input on browsers that lack it (e.g. Safari,
-  // Firefox).
-  const hasFileSystemAccess = 'showSaveFilePicker' in window && 'showOpenFilePicker' in window;
-  let fileHandle = null;
-
-  async function writeToFileHandle(handle) {
-    const writable = await handle.createWritable();
-    await writable.write(currentStateJSON());
-    await writable.close();
-  }
-
-  async function saveAs() {
-    if (hasFileSystemAccess) {
-      try {
-        const handle = await window.showSaveFilePicker({
-          suggestedName: 'cubes.json',
-          types: [{ description: 'Cubes Editor JSON', accept: { 'application/json': ['.json'] } }],
-        });
-        await writeToFileHandle(handle);
-        fileHandle = handle;
-      } catch (error) {
-        if (error?.name !== 'AbortError') console.error('Save As failed:', error);
-      }
-      return;
-    }
-
-    const blob = new Blob([currentStateJSON()], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'cubes.json';
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
-  async function save() {
-    if (hasFileSystemAccess && fileHandle) {
-      try {
-        await writeToFileHandle(fileHandle);
-        return;
-      } catch (error) {
-        console.error('Save failed, falling back to Save As:', error);
-      }
-    }
-    await saveAs();
-  }
+  const fileStore = createFileStore(snapshot);
+  const { save, saveAs } = fileStore;
+  // The file store parses; applyLoadedFile decides what the parsed state MEANS.
+  const load = (interpretation = 'cubes') => fileStore.load(interpretation, applyLoadedFile);
 
   function applyLoadedState(state) {
     if (!state) return;
@@ -871,60 +718,9 @@ async function main() {
     applyLoadedState({ ...state, positions });
   }
 
-  let fileInput = null;
-  let pendingInterpretation = 'cubes';
-
-  async function load(interpretation = 'cubes') {
-    if (hasFileSystemAccess) {
-      try {
-        const [handle] = await window.showOpenFilePicker({
-          types: [{ description: 'Cubes Editor JSON', accept: { 'application/json': ['.json'] } }],
-        });
-        const file = await handle.getFile();
-        const state = parseSavedState(await file.text());
-        if (!state) {
-          console.error('Load failed: file is not a valid cubes-editor save.');
-          return;
-        }
-        // Only track the file handle for write-back on a plain cubes load; a
-        // skeleton/abstract load derives a fresh model that shouldn't quietly
-        // overwrite the source file on the next Save.
-        fileHandle = interpretation === 'cubes' ? handle : null;
-        await applyLoadedFile(state, interpretation);
-      } catch (error) {
-        if (error?.name !== 'AbortError') console.error('Load failed:', error);
-      }
-      return;
-    }
-
-    pendingInterpretation = interpretation;
-    if (!fileInput) {
-      fileInput = document.createElement('input');
-      fileInput.type = 'file';
-      fileInput.accept = 'application/json';
-      fileInput.style.display = 'none';
-      document.body.appendChild(fileInput);
-      fileInput.addEventListener('change', async () => {
-        const file = fileInput.files?.[0];
-        fileInput.value = '';
-        if (!file) return;
-        const state = parseSavedState(await file.text());
-        if (!state) {
-          console.error('Load failed: file is not a valid cubes-editor save.');
-          return;
-        }
-        await applyLoadedFile(state, pendingInterpretation);
-      });
-    }
-    fileInput.click();
-  }
 
   function key(x, y, z) {
     return `${x},${y},${z}`;
-  }
-
-  function inBounds(x, y, z) {
-    return x >= MIN && x <= MAX && y >= MIN && y <= MAX && z >= MIN && z <= MAX;
   }
 
   function hasVoxel(x, y, z) {
@@ -1113,43 +909,27 @@ async function main() {
     return true;
   }
 
-  // Load a design from a URL given as the `design` query parameter — both
-  // absolute (?design=https://host/path/cubes.json) and relative
-  // (?design=designs/cubes.json) URLs are supported. Takes precedence over
-  // the autosaved localStorage state. Loaded via the same parse path as
-  // file loads and applied as a plain 'cubes' load (skeleton re-derived).
-  async function loadFromDesignParam() {
-    const raw = new URLSearchParams(window.location.search).get('design');
-    if (!raw) return null;
-    // Resolve against the page URL so a relative value fetches from the
-    // right base regardless of the current path; new URL(raw, base) accepts
-    // absolute URLs unchanged and turns relative ones into absolute.
-    const url = new URL(raw, window.location.href).href;
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      }
-      const state = parseSavedState(await response.text());
-      if (!state) {
-        throw new Error('not a valid cubes-editor save');
-      }
-      return state;
-    } catch (error) {
-      console.error(`Load from ?design=${url} failed:`, error);
-      errorEl.style.display = 'grid';
-      errorEl.textContent = `Load from design URL failed: ${error?.message || error}`;
-      return null;
-    }
-  }
-
   // Restore previously saved state, if any: face visibility and camera first
   // (so the position-restoring addVoxel calls below, which each trigger a
   // save, re-persist the already-correct values instead of clobbering
   // them with defaults), then the assembly itself. A `design` URL param, if
   // present and valid, overrides the autosaved localStorage state. With
   // nothing saved, fall back to a single cube centered in the build volume.
-  const saved = (await loadFromDesignParam()) ?? loadFromLocalStorage();
+  //
+  // loadFromDesignParam throws on a bad URL or unparseable file rather than
+  // reporting it itself (persistence.js owns no DOM), so the user-facing
+  // message is raised here and the load falls back to localStorage.
+  async function designParamState() {
+    try {
+      return await loadFromDesignParam();
+    } catch (error) {
+      console.error('Load from ?design= failed:', error);
+      errorEl.style.display = 'grid';
+      errorEl.textContent = `Load from design URL failed: ${error?.message || error}`;
+      return null;
+    }
+  }
+  const saved = (await designParamState()) ?? loadFromLocalStorage();
 
   if (saved?.camera) {
     camera.position.fromArray(saved.camera.position);
