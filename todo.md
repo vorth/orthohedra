@@ -2,10 +2,10 @@
 
 ## must have
 
-- add undo/redo support
 - better topology metrics
-- unambiguous face drag control
-- change face drag to plane swap:
+- face picking by construction, and user disambiguation
+- change face drag to plane swap + plane sharing
+- graph-preserving and -breaking modes
 
 ## nice to have
 

@@ -498,6 +498,153 @@ async function main() {
     return (px - cx) * (px - cx) + (pv - cv) * (pv - cv);
   }
 
+  // --- In-plane interference ------------------------------------------------
+  // Whether two faces sharing a grid plane would touch. This is what decides
+  // where a dragged face may land: a plane holding other faces is perfectly
+  // usable as long as the arriving cycle keeps clear of them.
+  //
+  // Every skeleton edge is axis-parallel with integer endpoints, so in-plane it
+  // is fully described by which of the two in-plane directions it runs along,
+  // its constant coordinate, and its span. That reduces the whole question to
+  // one-dimensional comparisons — no orientation, winding, or cross products.
+
+  // One in-plane [au,av,bu,bv] segment as { dir, fixed, s0, s1 }: `dir` is 0
+  // when the segment varies in u (so v is constant) and 1 when it varies in v;
+  // `fixed` is the constant coordinate; s0 <= s1 is the sorted span along `dir`.
+  // Skeleton edges always join two DISTINCT lattice points, so there are no
+  // zero-length segments to special-case.
+  function normalizeSeg([au, av, bu, bv]) {
+    if (av === bv) return { dir: 0, fixed: av, s0: Math.min(au, bu), s1: Math.max(au, bu) };
+    return { dir: 1, fixed: au, s0: Math.min(av, bv), s1: Math.max(av, bv) };
+  }
+
+  // A face's in-plane geometry prepared for interference testing: its
+  // normalized edges plus their bounding box, both in one pass.
+  function prepareFace(segments) {
+    const segs = [];
+    let u0 = Infinity;
+    let u1 = -Infinity;
+    let v0 = Infinity;
+    let v1 = -Infinity;
+    for (const seg of segments) {
+      segs.push(normalizeSeg(seg));
+      const [au, av, bu, bv] = seg;
+      u0 = Math.min(u0, au, bu);
+      u1 = Math.max(u1, au, bu);
+      v0 = Math.min(v0, av, bv);
+      v1 = Math.max(v1, av, bv);
+    }
+    return { segs, bbox: { u0, u1, v0, v1 } };
+  }
+
+  // Do two normalized in-plane edges interfere?
+  //
+  //   collinear  - same direction AND same fixed coordinate: interfere iff the
+  //                closed spans overlap AT ALL, a single shared endpoint
+  //                included. Two collinear brink edges that touch cannot both
+  //                survive as distinct edges.
+  //   parallel   - same direction, different fixed coordinate: never.
+  //   orthogonal - they MEET at (along-A = B.fixed, across-A = A.fixed) iff that
+  //                point lies on both closed segments. The meeting is harmless
+  //                only when it is a PROPER CROSSING: strictly interior to BOTH,
+  //                an X that passes through without either edge terminating on
+  //                the other. A T-junction (one edge's endpoint landing in the
+  //                other's interior) or a shared corner puts the point at an
+  //                endpoint of at least one edge, and interferes.
+  function segmentsInterfere(a, b) {
+    if (a.dir === b.dir) return a.fixed === b.fixed && a.s0 <= b.s1 && b.s0 <= a.s1;
+    const meets = a.s0 <= b.fixed && b.fixed <= a.s1 && b.s0 <= a.fixed && a.fixed <= b.s1;
+    if (!meets) return false;
+    const interiorA = a.s0 < b.fixed && b.fixed < a.s1;
+    const interiorB = b.s0 < a.fixed && a.fixed < b.s1;
+    return !(interiorA && interiorB);
+  }
+
+  // Do two prepared faces interfere? NEVER call this with a face against
+  // itself: a cycle's consecutive edges share corners, so it always interferes
+  // with itself.
+  function facesInterfere(a, b) {
+    // Cheap rejection: two faces whose bounding boxes do not even TOUCH can
+    // have no interfering edge pair. Note the comparison tests for a genuine
+    // GAP — boxes merely sharing a boundary line must still be tested, since a
+    // shared boundary is precisely the collinear-overlap and shared-corner case
+    // that does interfere.
+    if (a.bbox.u1 < b.bbox.u0 || b.bbox.u1 < a.bbox.u0) return false;
+    if (a.bbox.v1 < b.bbox.v0 || b.bbox.v1 < a.bbox.v0) return false;
+    for (const sa of a.segs) {
+      for (const sb of b.segs) {
+        if (segmentsInterfere(sa, sb)) return true;
+      }
+    }
+    return false;
+  }
+
+  // Project one skeleton face cycle into in-plane 2D segments, IF it lies in a
+  // plane normal to `axis`. Returns { coord, vertexIndices, segments } — the
+  // plane's edit-axis coordinate, the face's skeleton vertex indices, and its
+  // edges as in-plane [au,av,bu,bv] quadruples on the two other axes — or null
+  // for a face normal to either of the other two axes.
+  //
+  // This is the SINGLE definition of a face's in-plane geometry. The picker
+  // (which finds the grabbed cycle) and the plane index (which enumerates a
+  // plane's residents) must agree exactly, or a plane could be offered whose
+  // occupant the drag never actually tested.
+  function projectFace(skeleton, faceIdx, axis) {
+    const [ua, ub] = [0, 1, 2].filter((a) => a !== axis);
+    const faceEdges = skeleton.faces[faceIdx];
+    const vertexIndices = new Set();
+    const segments = [];
+    let coord = null;
+    for (const ei of faceEdges) {
+      const [vi, vj] = skeleton.edges[ei];
+      const a = skeleton.vertices[vi];
+      const b = skeleton.vertices[vj];
+      const ca = Math.round(a[axis]);
+      const cb = Math.round(b[axis]);
+      if (ca !== cb) return null; // an edge along `axis`: this face isn't normal to it
+      if (coord === null) coord = ca;
+      else if (ca !== coord) return null;
+      vertexIndices.add(vi);
+      vertexIndices.add(vj);
+      segments.push([Math.round(a[ua]), Math.round(a[ub]), Math.round(b[ua]), Math.round(b[ub])]);
+    }
+    if (coord === null || !segments.length) return null;
+    return { coord, vertexIndices: [...vertexIndices], segments };
+  }
+
+  // The faces resident in each plane normal to `axis`, prepared for
+  // interference testing, plus the skeleton's vertex extent on that axis (which
+  // bounds the candidate planes worth considering). Built ONCE per drag: the
+  // skeleton does not change while a drag is in flight, so rescanning per
+  // candidate plane would repeat this whole pass for every offered value.
+  //
+  // `excludeKey` names the dragged face, which must NOT appear in the index —
+  // it is the thing being moved, not a resident to keep clear of. It is
+  // excluded by KEY rather than index, matching how commitDrag re-resolves it.
+  function buildPlaneFaceIndex(skeleton, axis, excludeKey) {
+    const index = new Map(); // plane coord -> [{ segs, bbox }]
+    for (let faceIdx = 0; faceIdx < skeleton.faces.length; faceIdx++) {
+      if (skeleton.faceKeys[faceIdx] === excludeKey) continue;
+      const projected = projectFace(skeleton, faceIdx, axis);
+      if (!projected) continue; // normal to one of the other two axes
+      if (!index.has(projected.coord)) index.set(projected.coord, []);
+      index.get(projected.coord).push(prepareFace(projected.segments));
+    }
+
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const p of skeleton.vertices) {
+      const v = Math.round(p[axis]);
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    if (!Number.isFinite(lo)) {
+      lo = 0;
+      hi = 0;
+    }
+    return { index, lo, hi };
+  }
+
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
   // at the grabbed quad's coordinate) whose edges the grabbed quad is nearest.
   // Returns { coord, vertexIndices, segments }: the shared edit-axis coordinate,
@@ -531,26 +678,11 @@ async function main() {
     let best = null;
     let bestDist = Infinity;
     for (let faceIdx = 0; faceIdx < currentSkeleton.faces.length; faceIdx++) {
-      const faceEdges = currentSkeleton.faces[faceIdx];
-      const vertexIndices = new Set();
-      const segments = [];
-      let inPlane = true;
-      for (const ei of faceEdges) {
-        const [vi, vj] = currentSkeleton.edges[ei];
-        const a = currentSkeleton.vertices[vi];
-        const b = currentSkeleton.vertices[vj];
-        if (Math.round(a[axis]) !== coord || Math.round(b[axis]) !== coord) {
-          inPlane = false;
-          break;
-        }
-        vertexIndices.add(vi);
-        vertexIndices.add(vj);
-        segments.push([Math.round(a[ua]), Math.round(a[ub]), Math.round(b[ua]), Math.round(b[ub])]);
-      }
-      if (!inPlane || !segments.length) continue;
+      const projected = projectFace(currentSkeleton, faceIdx, axis);
+      if (!projected || projected.coord !== coord) continue;
       // Distance from the click point to this cycle = its nearest edge.
       let dist = Infinity;
-      for (const [au, av, bu, bv] of segments) {
+      for (const [au, av, bu, bv] of projected.segments) {
         dist = Math.min(dist, pointSegDist2(hu, hv, au, av, bu, bv));
       }
       if (dist < bestDist) {
@@ -558,41 +690,52 @@ async function main() {
         // `key` names this face independently of index order, so the commit can
         // re-resolve it against a freshly computed skeleton instead of trusting
         // indices captured when the drag began.
-        best = { coord, key: currentSkeleton.faceKeys[faceIdx], vertexIndices: [...vertexIndices], segments };
+        best = {
+          coord,
+          key: currentSkeleton.faceKeys[faceIdx],
+          vertexIndices: projected.vertexIndices,
+          segments: projected.segments,
+        };
       }
     }
 
     return best; // null if no in-plane bounding face was found (shouldn't happen)
   }
 
-  // Edit-axis integer values that hold NO boundary face orthogonal to the edit
-  // axis (the drag's valid snap destinations). Always includes three planes
-  // just beyond each extreme of the assembly on that axis, plus any interior
-  // gaps. Excludes `excludeCoord` (the face's own current plane) so it isn't
-  // offered as a destination.
-  function computeAvailablePlanes(axis, excludeCoord) {
-    const faces = boundaryFaceInfoByAxis[axis];
-    const occupiedVals = new Set();
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (const f of faces) {
-      const v = Math.round(f.center[axis]);
-      occupiedVals.add(v);
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
-    }
-    if (!Number.isFinite(lo)) {
-      lo = 0;
-      hi = 0;
-    }
-
-    // A boundary face plane can lie anywhere from MIN to MAX+1 (the giant
-    // boundary cube spans world volume [MIN, MAX+1]); never offer a landing
-    // plane outside it.
+  // Edit-axis integer values where the dragged face, placed there, would not
+  // INTERFERE with any face already in that plane (the drag's valid snap
+  // destinations). Excludes `excludeCoord` (the face's own current plane) so it
+  // isn't offered as a destination.
+  //
+  // This replaces a far cruder rule — "offer only planes holding no boundary
+  // face at all" — which was global-per-plane: one unit square anywhere in a
+  // plane disqualified it for every face in the model, however far apart they
+  // were. Faces may now SHARE a plane, so long as the arriving cycle keeps
+  // clear of the residents. They may even cross one in an X, but they may not
+  // touch: a shared corner, a T-junction, or any collinear overlap would fuse
+  // or double up brink elements, which a graph-PRESERVING edit may not do. See
+  // segmentsInterfere for the edge-level rule.
+  //
+  // The dragged face's in-plane footprint is PLANE-INDEPENDENT — translating a
+  // face along its own normal leaves its 2D segments untouched — so `dragged`
+  // is prepared once by the caller and tested unchanged against every candidate.
+  //
+  // The candidate range is the model's extent on this axis (from the plane
+  // index) plus three planes of headroom each way, enough to pull a face clear
+  // of the assembly. Occupancy no longer prunes anything, so this only bounds
+  // the work; dragBounds supplies the real travel limit. A boundary face plane
+  // can lie anywhere from MIN to MAX+1 (the giant boundary cube spans world
+  // volume [MIN, MAX+1]); never offer a landing plane outside it.
+  function computeAvailablePlanes(axis, excludeCoord, dragged, planeIndex, modelLo, modelHi) {
     const values = [];
-    for (let v = Math.max(lo - 3, MIN); v <= Math.min(hi + 3, MAX + 1); v++) {
+    for (let v = Math.max(modelLo - 3, MIN); v <= Math.min(modelHi + 3, MAX + 1); v++) {
       if (v === excludeCoord) continue;
-      if (!occupiedVals.has(v)) values.push(v);
+      const residents = planeIndex.get(v);
+      if (!residents) {
+        values.push(v); // an empty plane is always free
+        continue;
+      }
+      if (residents.every((resident) => !facesInterfere(dragged, resident))) values.push(v);
     }
     return values;
   }
@@ -677,6 +820,16 @@ async function main() {
       return q;
     });
 
+    // For the face-drag caller this is now belt-and-braces, and provably so:
+    // computeAvailablePlanes only offers planes where the arriving cycle
+    // touches nothing, and a coincident vertex is necessarily a touch. Every
+    // vertex at coordinate `plane` has degree exactly 2 within that plane (see
+    // brinkSkeleton.js's face construction), so it belongs to some resident
+    // cycle the index tested; and a point shared with the arriving cycle is an
+    // endpoint of an edge on BOTH sides, which is never the strictly-interior
+    // proper crossing the interference rule permits. The check stays because it
+    // is cheap, it guards the general multi-face signature, and a silent vertex
+    // fusion would be unrecoverable.
     const distinct = new Set(vertices.map((p) => `${p[0]},${p[1]},${p[2]}`));
     if (distinct.size !== vertices.length) return null; // would fuse vertices
 
@@ -1529,16 +1682,32 @@ async function main() {
   function startDrag(axis, hitId, hitPoint) {
     const face = connectedFace(axis, hitId, hitPoint);
     if (!face) return false; // not a grabbable face: let the gesture rotate the camera
-    // Candidate destination planes, then discard any that would drive a dragged
-    // vertex past a collinear neighbor (overlapping the neighboring edge).
+    // Candidate destination planes — those where the arriving cycle would touch
+    // none of the plane's residents — then discard any that would drive a
+    // dragged vertex past a collinear neighbor on its DRAG-AXIS line
+    // (overlapping the neighboring edge). The two constraints are independent:
+    // the in-plane interference test cannot see an overlap along the drag axis,
+    // and dragBounds cannot see one within the destination plane.
+    const dragged = prepareFace(face.segments);
+    const { index, lo: modelLo, hi: modelHi } = buildPlaneFaceIndex(currentSkeleton, axis, face.key);
     const { lo, hi, impeders } = dragBounds(axis, face.vertexIndices, currentSkeleton);
-    const values = computeAvailablePlanes(axis, face.coord).filter((v) => v > lo && v < hi);
+    const values = computeAvailablePlanes(axis, face.coord, dragged, index, modelLo, modelHi)
+      .filter((v) => v > lo && v < hi);
     if (!values.length) {
-      // The face is grabbable but boxed in — every candidate plane is occupied
-      // or blocked by a collinear neighbor, so there is nowhere legal to move.
-      // Still CONSUME the gesture (suspend the trackball) and show the impeders,
-      // so it reads as "trapped, here's why" instead of an unexpected camera
-      // rotation. No live `drag`: pointermove/up just clear the preview.
+      // The face is grabbable but boxed in by its collinear neighbors, so there
+      // is nowhere legal to move. Still CONSUME the gesture (suspend the
+      // trackball) and show the impeders, so it reads as "trapped, here's why"
+      // instead of an unexpected camera rotation. No live `drag`:
+      // pointermove/up just clear the preview.
+      //
+      // The impeders are a COMPLETE explanation: interference alone can never
+      // empty this list. The candidate range always reaches modelHi + 1 and
+      // modelLo - 1, where no skeleton vertex — hence no resident face —
+      // exists, so those two planes are unconditionally interference-free.
+      // Only dragBounds can cut them off (or, for a model pressed against the
+      // world wall, the MIN/MAX clamp, where inBounds is already the operative
+      // constraint). Interference can still punch holes in the middle of the
+      // reachable interval; it just cannot close both ends.
       trapped = true;
       controls.enabled = false;
       showImpeders(impeders);
