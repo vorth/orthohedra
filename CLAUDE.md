@@ -6,7 +6,8 @@ A web app for exploring **orthogonal polyhedra** — shapes assembled from unit 
 
 - **Zero build step.** No `package.json`, no framework, no bundler. Plain static files served directly. Three.js is loaded from `esm.sh` via bare ES module imports (currently `three@0.172.0`).
 - **Served via VS Code Live Server** on `http://localhost:5501` (see `.vscode/`).
-- Files: `index.html`, `styles.css`, `main.js` (the bulk of the app), `brinkSkeleton.js`, `realizeSkeleton.js`, `realizeWorker.js` (Web Worker). `main.js`/`styles.css` were originally inline in `index.html` and extracted later.
+- Files: `index.html` and `styles.css` at the root; all JavaScript lives in `js/`. `js/main.js` is still the bulk of the app (scene, rendering, persistence, undo/redo, drag state machine, DOM wiring); alongside it are `js/constants.js`, `js/faceGeometry.js` (pure face-drag geometry — the interference rule), `js/realization.js` (abstract-realization worker lifecycle), `js/brinkSkeleton.js`, `js/realizeSkeleton.js`, and `js/realizeWorker.js` (the Web Worker itself). `main.js`/`styles.css` were originally inline in `index.html` and extracted later; `main.js` is being progressively split further (see `module-split-notes.md`).
+- Module paths are all `./`-relative between siblings in `js/`, and `realization.js` spawns the worker via `new URL('./realizeWorker.js', import.meta.url)` — so the JS files must stay in one directory together. The `?design=` query parameter resolves against `window.location.href` instead, so relative design URLs stay page-relative (e.g. `designs/foo.json`).
 
 ## The source of truth
 

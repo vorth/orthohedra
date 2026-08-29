@@ -16,6 +16,7 @@ import {
   dragBounds,
   applyGraphDrawingEdit,
 } from "./faceGeometry.js";
+import { createRealizer } from "./realization.js";
 
 // Initial per-mesh instance capacity; ensureInstanceCapacity() grows it (to the
 // next power of two) whenever a render needs more.
@@ -828,56 +829,10 @@ async function main() {
     }
   }
 
-  // --- Abstract realization worker ---------------------------------------
-  // The abstract gesture strips the skeleton's coordinates and re-realizes
-  // them, then fills cubes. Realization backtracks to find a valid slab
-  // ordering and can take seconds on large models, so it runs in a worker to
-  // keep the UI responsive; the worker can be terminated to cancel. NOTE:
-  // BEST-EFFORT — an abstract skeleton underdetermines geometry, so the
-  // recovered solid has a skeleton isomorphic to the input but may differ in
-  // shape/pose from the original.
-  let busy = false;
-  function setBusy(on) {
-    busy = on;
-    busyOverlay.hidden = !on;
-  }
-
-  let realizeWorker = null;
-  let realizeReject = null; // reject fn of the in-flight realization, if any
-
-  function realizeAbstract(skeleton) {
-    return new Promise((resolve, reject) => {
-      realizeWorker = new Worker(new URL('./realizeWorker.js', import.meta.url), { type: 'module' });
-      realizeReject = reject;
-      realizeWorker.onmessage = (event) => {
-        const { cubes, error } = event.data;
-        teardownWorker();
-        if (error) reject(new Error(error));
-        else resolve(cubes);
-      };
-      realizeWorker.onerror = (event) => {
-        teardownWorker();
-        reject(new Error(event.message || 'Realization worker failed'));
-      };
-      realizeWorker.postMessage({ skeleton });
-    });
-  }
-
-  function teardownWorker() {
-    if (realizeWorker) {
-      realizeWorker.terminate();
-      realizeWorker = null;
-    }
-    realizeReject = null;
-  }
-
-  function cancelRealization() {
-    if (realizeReject) {
-      const reject = realizeReject;
-      teardownWorker();
-      reject(new Error('cancelled'));
-    }
-  }
+  // The abstract-realization worker (see realization.js). Owns the busy flag;
+  // `busy` is read through realizer.isBusy() at the edit and keyboard guards.
+  const realizer = createRealizer(busyOverlay);
+  const { setBusy, realizeAbstract, cancelRealization } = realizer;
 
   async function applyLoadedFile(state, interpretation) {
     // A plain open of a file that carries a graph but NO drawing has to
@@ -1277,7 +1232,7 @@ async function main() {
   }
 
   function handleEdit(clientX, clientY) {
-    if (busy) return; // edits are suspended while a realization runs
+    if (realizer.isBusy()) return; // edits are suspended while a realization runs
     const hits = getIntersection(clientX, clientY);
 
     // A click that misses every small boundary-cube face falls through to the
@@ -1506,7 +1461,7 @@ async function main() {
   // Cmd/Ctrl+Z to undo, Cmd/Ctrl+Shift+Z or Ctrl+Y to redo. Suspended while a
   // realization is running or a drag is in flight, matching the edit guards.
   window.addEventListener('keydown', (event) => {
-    if (busy || drag || trapped) return;
+    if (realizer.isBusy() || drag || trapped) return;
     const accel = event.metaKey || event.ctrlKey;
     if (!accel) return;
     const key = event.key.toLowerCase();
@@ -1527,7 +1482,7 @@ async function main() {
     // In move mode, grabbing ANY visible boundary face starts a drag along that
     // face's normal axis, and suspends the trackball so the camera doesn't
     // rotate mid-drag. The axis is whichever face mesh was hit.
-    if (moveMode && !busy) {
+    if (moveMode && !realizer.isBusy()) {
       const hit = getIntersection(event.clientX, event.clientY)[0];
       if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
         const axis = cubeFaceMeshes.indexOf(hit.object);
