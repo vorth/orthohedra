@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 830" width="1180" height="830" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a93a6"/>
+    </marker>
+    <marker id="arrowWorker" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c47f2a"/>
+    </marker>
+    <marker id="arrowExt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7a6ca8"/>
+    </marker>
+    <style>
+      .box  { rx: 9; stroke-width: 1.5; }
+      .name { font-size: 14px; font-weight: 600; fill: #1c2230; }
+      .loc  { font-size: 11px; fill: #6b7280; }
+      .role { font-size: 10.5px; fill: #6b7280; }
+      .imp  { font-size: 10.5px; fill: #4a5265; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .edge { fill: none; stroke: #8a93a6; stroke-width: 1.4; }
+      .edgeW{ fill: none; stroke: #c47f2a; stroke-width: 1.4; stroke-dasharray: 5 4; }
+      .edgeE{ fill: none; stroke: #7a6ca8; stroke-width: 1.4; }
+      .title{ font-size: 19px; font-weight: 700; fill: #1c2230; }
+      .sub  { font-size: 12px; fill: #6b7280; }
+      .lgd  { font-size: 11px; fill: #4a5265; }
+    </style>
+  </defs>
+
+  <rect width="1180" height="830" fill="#fbfbfd"/>
+
+  <text x="34" y="40" class="title">Orthohedra — module graph</text>
+  <text x="34" y="61" class="sub">Arrows point from importer to imported, labelled with the names actually imported. Line counts as of the step-4 split.</text>
+
+  <!-- ============ ENTRY ============ -->
+  <rect x="34" y="92" width="200" height="52" class="box" fill="#eef1f7" stroke="#b9c0d0"/>
+  <text x="52" y="115" class="name">index.html</text>
+  <text x="52" y="132" class="loc">&lt;script type="module"&gt;</text>
+
+  <!-- ============ MAIN ============ -->
+  <rect x="34" y="196" width="200" height="86" class="box" fill="#dfe7f7" stroke="#7d97cc"/>
+  <text x="52" y="221" class="name">main.js</text>
+  <text x="52" y="238" class="loc">869 lines</text>
+  <text x="52" y="256" class="role">orchestrator: voxels, undo/redo,</text>
+  <text x="52" y="269" class="role">drag state machine, DOM wiring</text>
+
+  <!-- ============ SCENE RENDERER ============ -->
+  <rect x="404" y="92" width="212" height="86" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="117" class="name">sceneRenderer.js</text>
+  <text x="422" y="134" class="loc">590 lines</text>
+  <text x="422" y="152" class="role">data → pixels. Sole owner of</text>
+  <text x="422" y="165" class="role">every three.js import.</text>
+
+  <!-- ============ PERSISTENCE ============ -->
+  <rect x="404" y="222" width="212" height="72" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="247" class="name">persistence.js</text>
+  <text x="422" y="264" class="loc">282 lines</text>
+  <text x="422" y="282" class="role">save format, validation, file I/O</text>
+
+  <!-- ============ REALIZATION ============ -->
+  <rect x="404" y="338" width="212" height="72" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="363" class="name">realization.js</text>
+  <text x="422" y="380" class="loc">67 lines</text>
+  <text x="422" y="398" class="role">worker lifecycle, busy flag</text>
+
+  <!-- ============ FACE GEOMETRY ============ -->
+  <rect x="404" y="454" width="212" height="72" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="479" class="name">faceGeometry.js</text>
+  <text x="422" y="496" class="loc">317 lines</text>
+  <text x="422" y="514" class="role">pure: the interference rule</text>
+
+  <!-- ============ BRINK SKELETON ============ -->
+  <rect x="404" y="570" width="212" height="72" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="595" class="name">brinkSkeleton.js</text>
+  <text x="422" y="612" class="loc">276 lines</text>
+  <text x="422" y="630" class="role">pure: graph construction</text>
+
+  <!-- ============ REALIZE SKELETON ============ -->
+  <rect x="404" y="686" width="212" height="72" class="box" fill="#e2f0e6" stroke="#7fae90"/>
+  <text x="422" y="711" class="name">realizeSkeleton.js</text>
+  <text x="422" y="728" class="loc">405 lines</text>
+  <text x="422" y="746" class="role">pure: realize + fill</text>
+
+  <!-- ============ CONSTANTS ============ -->
+  <rect x="880" y="454" width="200" height="72" class="box" fill="#f7f0dd" stroke="#c9b47a"/>
+  <text x="898" y="479" class="name">constants.js</text>
+  <text x="898" y="496" class="loc">35 lines</text>
+  <text x="898" y="514" class="role">shared values + inBounds</text>
+
+  <!-- ============ WORKER ============ -->
+  <rect x="880" y="686" width="200" height="72" class="box" fill="#faeedd" stroke="#c47f2a"/>
+  <text x="898" y="711" class="name">realizeWorker.js</text>
+  <text x="898" y="728" class="loc">20 lines</text>
+  <text x="898" y="746" class="role">Web Worker entry point</text>
+
+  <!-- ============ THREE.JS ============ -->
+  <rect x="880" y="92" width="200" height="86" class="box" fill="#efeaf7" stroke="#7a6ca8"/>
+  <text x="898" y="117" class="name">three@0.172.0</text>
+  <text x="898" y="134" class="loc">esm.sh (external)</text>
+  <text x="898" y="152" class="role">THREE, TrackballControls,</text>
+  <text x="898" y="165" class="role">Line2, LineMaterial, …</text>
+
+  <!-- ===================== EDGES ===================== -->
+
+  <!-- index.html -> main.js -->
+  <path d="M 134 144 L 134 196" class="edge" marker-end="url(#arrow)"/>
+
+  <!-- main -> sceneRenderer -->
+  <path d="M 234 216 C 320 216, 330 135, 404 135" class="edge" marker-end="url(#arrow)"/>
+  <text x="252" y="176" class="imp">createSceneRenderer</text>
+
+  <!-- main -> persistence -->
+  <path d="M 234 240 C 320 240, 330 252, 404 252" class="edge" marker-end="url(#arrow)"/>
+  <text x="246" y="236" class="imp">saveToLocalStorage as writeLocalStorage,</text>
+  <text x="246" y="249" class="imp">loadFromLocalStorage, createFileStore,</text>
+  <text x="246" y="262" class="imp">loadFromDesignParam</text>
+
+  <!-- main -> realization -->
+  <path d="M 234 262 C 320 300, 330 372, 404 372" class="edge" marker-end="url(#arrow)"/>
+  <text x="266" y="332" class="imp">createRealizer</text>
+
+  <!-- main -> faceGeometry -->
+  <path d="M 150 282 C 150 420, 300 488, 404 488" class="edge" marker-end="url(#arrow)"/>
+  <text x="166" y="410" class="imp">inPlaneAxes, pointSegDist2,</text>
+  <text x="166" y="423" class="imp">prepareFace, projectFace,</text>
+  <text x="166" y="436" class="imp">buildPlaneFaceIndex,</text>
+  <text x="166" y="449" class="imp">computeAvailablePlanes,</text>
+  <text x="166" y="462" class="imp">dragBounds, applyGraphDrawingEdit</text>
+
+  <!-- main -> brinkSkeleton -->
+  <path d="M 110 282 C 110 520, 280 604, 404 604" class="edge" marker-end="url(#arrow)"/>
+  <text x="120" y="566" class="imp">computeBrinkSkeleton,</text>
+  <text x="120" y="579" class="imp">logBrinkSkeleton</text>
+
+  <!-- main -> realizeSkeleton -->
+  <path d="M 70 282 C 70 640, 260 720, 404 720" class="edge" marker-end="url(#arrow)"/>
+  <text x="80" y="686" class="imp">fillCubesFromSkeleton</text>
+
+  <!-- main -> constants (long route under everything) -->
+  <path d="M 234 276 C 700 300, 760 400, 880 470" class="edge" marker-end="url(#arrow)"/>
+  <text x="646" y="330" class="imp">MIN, MAX, inBounds</text>
+
+  <!-- sceneRenderer -> three -->
+  <path d="M 616 128 L 880 128" class="edgeE" marker-end="url(#arrowExt)"/>
+  <text x="668" y="120" class="imp">* as THREE, TrackballControls,</text>
+  <text x="668" y="133" class="imp">Line2, LineMaterial, LineSegmentsGeometry</text>
+
+  <!-- sceneRenderer -> constants -->
+  <path d="M 616 160 C 780 200, 820 400, 940 454" class="edge" marker-end="url(#arrow)"/>
+  <text x="700" y="248" class="imp">MIN, MAX, AXIS_COLORS,</text>
+  <text x="700" y="261" class="imp">FACE_COLORS, FACE_SOLID,</text>
+  <text x="700" y="274" class="imp">FACE_TRANSLUCENT, FACE_HIDDEN</text>
+
+  <!-- sceneRenderer -> faceGeometry -->
+  <path d="M 510 178 C 630 300, 640 420, 570 454" class="edge" marker-end="url(#arrow)"/>
+  <text x="586" y="386" class="imp">inPlaneAxes</text>
+
+  <!-- sceneRenderer -> brinkSkeleton -->
+  <path d="M 448 178 C 360 320, 360 470, 440 570" class="edge" marker-end="url(#arrow)"/>
+  <text x="286" y="470" class="imp">computeBoundaryCubeFaces</text>
+
+  <!-- persistence -> constants -->
+  <path d="M 616 272 C 760 300, 800 400, 900 454" class="edge" marker-end="url(#arrow)"/>
+  <text x="640" y="418" class="imp">FACE_SOLID, FACE_TRANSLUCENT,</text>
+  <text x="640" y="431" class="imp">FACE_HIDDEN, STORAGE_KEY, inBounds</text>
+
+  <!-- faceGeometry -> constants -->
+  <path d="M 616 486 L 880 486" class="edge" marker-end="url(#arrow)"/>
+  <text x="700" y="478" class="imp">MIN, MAX</text>
+
+  <!-- realization ~> worker (new Worker, not an import) -->
+  <path d="M 616 396 C 740 420, 800 620, 940 686" class="edgeW" marker-end="url(#arrowWorker)"/>
+  <text x="700" y="560" class="imp" fill="#a8641a">new Worker(new URL(</text>
+  <text x="700" y="573" class="imp" fill="#a8641a">'./realizeWorker.js',</text>
+  <text x="700" y="586" class="imp" fill="#a8641a">import.meta.url))</text>
+
+  <!-- worker -> realizeSkeleton -->
+  <path d="M 880 730 L 616 730" class="edge" marker-end="url(#arrow)"/>
+  <text x="646" y="722" class="imp">realizeAbstractSkeleton,</text>
+  <text x="646" y="757" class="imp">toAbstractSkeleton, fillCubesFromSkeleton</text>
+
+  <!-- ===================== LEGEND ===================== -->
+  <rect x="34" y="726" width="330" height="78" rx="8" fill="#ffffff" stroke="#d8dce5"/>
+  <text x="50" y="748" class="lgd" font-weight="700">Legend</text>
+
+  <line x1="52" y1="764" x2="86" y2="764" class="edge" marker-end="url(#arrow)"/>
+  <text x="94" y="768" class="lgd">ES module import</text>
+
+  <line x1="52" y1="784" x2="86" y2="784" class="edgeW" marker-end="url(#arrowWorker)"/>
+  <text x="94" y="788" class="lgd">spawned as a Worker (sibling URL)</text>
+
+  <rect x="214" y="757" width="13" height="13" rx="3" fill="#efeaf7" stroke="#7a6ca8"/>
+  <text x="234" y="768" class="lgd">external (esm.sh)</text>
+
+  <rect x="214" y="777" width="13" height="13" rx="3" fill="#f7f0dd" stroke="#c9b47a"/>
+  <text x="234" y="788" class="lgd">leaf: no imports of its own</text>
+</svg>
