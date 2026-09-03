@@ -241,102 +241,110 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
   scene.add(hoverOutline);
 
   // --- Move mode visuals ---------------------------------------------------
-  // Both the available planes and the drag indicator are drawn as the DRAGGED
-  // FACE's own footprint (its set of unit quads), not generic grids: the
-  // available planes show where that footprint would land at each valid
-  // destination, as purple outlines in place in the column; the drag indicator
-  // is an outline while free-floating and fills solid once it snaps.
-  const AVAIL_PLANE_COLOR = 0x9b5cff; // purple
-
-  // Orientation to face the footprint squares along `axis` (default normal +Z).
-  const availPlaneQuaternions = [
-    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2), // +Z -> +X
-    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2), // +Z -> +Y
-    new THREE.Quaternion(), // +Z -> +Z
-  ];
-
-  // The dragged face and its available destinations are drawn directly from the
-  // face's brink-skeleton EDGES: `segments` are its in-plane [au,av,bu,bv] edge
-  // endpoints (on the two non-edit axes). `edgePositions` lifts them into world
-  // space at the given edit-axis value(s) as a flat line-segment array.
-  const _segP = [0, 0, 0];
-  function edgePositions(axis, segments, values) {
-    const [ua, ub] = inPlaneAxes(axis);
-    const merged = [];
-    for (const value of values) {
-      _segP[axis] = value;
-      for (const [au, av, bu, bv] of segments) {
-        _segP[ua] = au;
-        _segP[ub] = av;
-        merged.push(_segP[0], _segP[1], _segP[2]);
-        _segP[ua] = bu;
-        _segP[ub] = bv;
-        merged.push(_segP[0], _segP[1], _segP[2]);
-      }
-    }
-    return merged;
-  }
-
+  // The swapping drag renders the dragged face's SETTLED position as itself:
+  // its vertices and edges are real skeleton geometry, rewritten in place each
+  // time a step fires. On top of that sits the purple outline of the grabbed
+  // cycle, drawn at the RAW drag value rather than at an integer plane.
+  //
+  // The outline is what makes the gesture feel continuous. Steps are discrete,
+  // so the skeleton can only ever jump from one plane to the next; the outline
+  // moves smoothly with the pointer and the skeleton snaps to it. It also shows
+  // a skip for what it is — the outline glides across the skipped plane while
+  // the skeleton jumps over it.
+  //
   // Outlines use three's fat-line classes (Line2 + LineMaterial) for genuine
   // screen-space thickness — LineBasicMaterial.linewidth is clamped to 1px by
   // WebGL. `linewidth` is in world/pixel units per LineMaterial; resolution
-  // must track the canvas size (kept current on resize below). `replaceOutline`
-  // swaps the LineSegmentsGeometry from a flat position array.
-  const OUTLINE_LINEWIDTH = 4; // ~twice the former 1px hairline, in device px
-  const DRAG_LINEWIDTH_SNAPPED = 8; // thicker + brighter when snapped to a plane
-  const availableOutlineMaterial = new LineMaterial({
-    color: AVAIL_PLANE_COLOR,
+  // must track the canvas size (kept current on resize below).
+  const GRABBED_COLOR = 0xd8b8ff;
+  const OUTLINE_LINEWIDTH = 6;
+
+  // The grabbed face is drawn from its brink-skeleton EDGES: `segments` are its
+  // in-plane [au,av,bu,bv] endpoints (on the two non-edit axes), lifted into
+  // world space at the given edit-axis value. `out` is filled in place — this
+  // runs on every pointermove, so it must not allocate.
+  const _segP = [0, 0, 0];
+  function writeEdgePositions(axis, segments, value, out) {
+    const [ua, ub] = inPlaneAxes(axis);
+    _segP[axis] = value;
+    let i = 0;
+    for (const [au, av, bu, bv] of segments) {
+      _segP[ua] = au;
+      _segP[ub] = av;
+      out[i++] = _segP[0];
+      out[i++] = _segP[1];
+      out[i++] = _segP[2];
+      _segP[ua] = bu;
+      _segP[ub] = bv;
+      out[i++] = _segP[0];
+      out[i++] = _segP[1];
+      out[i++] = _segP[2];
+    }
+    return out;
+  }
+
+  const grabbedMaterial = new LineMaterial({
+    color: GRABBED_COLOR,
     linewidth: OUTLINE_LINEWIDTH,
+    // The dragged face is frequently inside the assembly — and the cube shell
+    // is frozen mid-drag, so it does not open up as the face leaves. Draw the
+    // outline through everything, or the feedback vanishes exactly when the
+    // drag needs it.
+    depthTest: false,
   });
-  const dragOutlineMaterial = new LineMaterial({ color: 0xd8b8ff, linewidth: OUTLINE_LINEWIDTH });
-  const outlineMaterials = [availableOutlineMaterial, dragOutlineMaterial];
+  grabbedMaterial.transparent = true;
   function updateOutlineResolution() {
-    for (const m of outlineMaterials) m.resolution.set(window.innerWidth, window.innerHeight);
+    grabbedMaterial.resolution.set(window.innerWidth, window.innerHeight);
   }
   updateOutlineResolution();
 
-  function makeOutline(material, renderOrder) {
-    const line = new Line2(new LineSegmentsGeometry(), material);
-    line.frustumCulled = false;
-    line.renderOrder = renderOrder;
-    line.visible = false;
-    scene.add(line);
-    return line;
-  }
+  const grabbedOutline = new Line2(new LineSegmentsGeometry(), grabbedMaterial);
+  grabbedOutline.frustumCulled = false;
+  grabbedOutline.renderOrder = 5;
+  grabbedOutline.visible = false;
+  scene.add(grabbedOutline);
 
-  function replaceOutline(line, positions) {
-    line.geometry.dispose();
+  // Scratch position array for the outline, sized to the grabbed cycle when the
+  // drag starts and reused for every subsequent move.
+  let grabbedPositions = null;
+
+  // Begin tracking a grabbed cycle. Allocates the geometry ONCE per drag;
+  // moveGrabbedFace then only rewrites its position attribute.
+  function showGrabbedFace(axis, segments, value) {
+    grabbedPositions = new Float32Array(segments.length * 6);
+    writeEdgePositions(axis, segments, value, grabbedPositions);
+    grabbedOutline.geometry.dispose();
     const geo = new LineSegmentsGeometry();
-    geo.setPositions(positions);
-    line.geometry = geo;
+    geo.setPositions(grabbedPositions);
+    grabbedOutline.geometry = geo;
+    grabbedOutline.visible = true;
   }
 
-  // Available planes: the dragged face's edges drawn at every valid destination
-  // value (in place in the column).
-  const availableOutlines = makeOutline(availableOutlineMaterial, 2);
-
-  function showAvailablePlanes(axis, values, segments) {
-    replaceOutline(availableOutlines, edgePositions(axis, segments, values));
-    availableOutlines.visible = true;
+  // Slide the outline to `value` — called on every pointermove, so it updates
+  // the existing buffers in place rather than rebuilding the geometry.
+  // LineSegmentsGeometry stores each segment as instanced start/end attributes,
+  // so both are refreshed from the same flat array.
+  function moveGrabbedFace(axis, segments, value) {
+    if (!grabbedPositions) return;
+    writeEdgePositions(axis, segments, value, grabbedPositions);
+    const geo = grabbedOutline.geometry;
+    const start = geo.getAttribute('instanceStart');
+    const end = geo.getAttribute('instanceEnd');
+    if (!start || !end) return;
+    // instanceStart and instanceEnd are interleaved views on ONE buffer, so
+    // writing through either updates both; upload it once.
+    start.data.set(grabbedPositions);
+    start.data.needsUpdate = true;
+    // Both bounds are derived from the same buffer and go stale when it moves.
+    // `frustumCulled` is off for this outline, but LineSegmentsGeometry's own
+    // bounds are cheap and keeping them honest avoids a surprise if anything
+    // later raycasts against it.
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();
   }
 
-  function hideAvailablePlanes() {
-    availableOutlines.visible = false;
-  }
-
-  // Drag indicator: the dragged face's edges, moving with the drag. Brighter
-  // and thicker once it snaps to an available plane (a release would commit).
-  const dragOutlineMesh = makeOutline(dragOutlineMaterial, 3);
-
-  function renderDragIndicator(axis, segments, atValue, snapped) {
-    replaceOutline(dragOutlineMesh, edgePositions(axis, segments, [atValue]));
-    dragOutlineMaterial.linewidth = snapped ? DRAG_LINEWIDTH_SNAPPED : OUTLINE_LINEWIDTH;
-    dragOutlineMaterial.color.set(snapped ? 0xffffff : 0xd8b8ff);
-    dragOutlineMesh.visible = true;
-  }
-
-  function hideDragIndicator() {
-    dragOutlineMesh.visible = false;
+  function hideGrabbedFace() {
+    grabbedOutline.visible = false;
   }
 
   // Brink skeleton rendering: white spheres at vertices, and
@@ -564,10 +572,9 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
     applyFaceVisibility,
     cycleFaceVisibility,
     // drag visuals
-    showAvailablePlanes,
-    hideAvailablePlanes,
-    renderDragIndicator,
-    hideDragIndicator,
+    showGrabbedFace,
+    moveGrabbedFace,
+    hideGrabbedFace,
     showImpeders,
     hideImpeders,
     // hover

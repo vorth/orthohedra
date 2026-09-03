@@ -148,77 +148,6 @@ export function projectFace(skeleton, faceIdx, axis) {
   return { coord, vertexIndices: [...vertexIndices], segments };
 }
 
-// The faces resident in each plane normal to `axis`, prepared for
-// interference testing, plus the skeleton's vertex extent on that axis (which
-// bounds the candidate planes worth considering). Built ONCE per drag: the
-// skeleton does not change while a drag is in flight, so rescanning per
-// candidate plane would repeat this whole pass for every offered value.
-//
-// `excludeKey` names the dragged face, which must NOT appear in the index —
-// it is the thing being moved, not a resident to keep clear of. It is
-// excluded by KEY rather than index, matching how commitDrag re-resolves it.
-export function buildPlaneFaceIndex(skeleton, axis, excludeKey) {
-  const index = new Map(); // plane coord -> [{ segs, bbox }]
-  for (let faceIdx = 0; faceIdx < skeleton.faces.length; faceIdx++) {
-    if (skeleton.faceKeys[faceIdx] === excludeKey) continue;
-    const projected = projectFace(skeleton, faceIdx, axis);
-    if (!projected) continue; // normal to one of the other two axes
-    if (!index.has(projected.coord)) index.set(projected.coord, []);
-    index.get(projected.coord).push(prepareFace(projected.segments));
-  }
-
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const p of skeleton.vertices) {
-    const v = Math.round(p[axis]);
-    if (v < lo) lo = v;
-    if (v > hi) hi = v;
-  }
-  if (!Number.isFinite(lo)) {
-    lo = 0;
-    hi = 0;
-  }
-  return { index, lo, hi };
-}
-
-// Edit-axis integer values where the dragged face, placed there, would not
-// INTERFERE with any face already in that plane (the drag's valid snap
-// destinations). Excludes `excludeCoord` (the face's own current plane) so it
-// isn't offered as a destination.
-//
-// This replaces a far cruder rule — "offer only planes holding no boundary
-// face at all" — which was global-per-plane: one unit square anywhere in a
-// plane disqualified it for every face in the model, however far apart they
-// were. Faces may now SHARE a plane, so long as the arriving cycle keeps
-// clear of the residents. They may even cross one in an X, but they may not
-// touch: a shared corner, a T-junction, or any collinear overlap would fuse
-// or double up brink elements, which a graph-PRESERVING edit may not do. See
-// segmentsInterfere for the edge-level rule.
-//
-// The dragged face's in-plane footprint is PLANE-INDEPENDENT — translating a
-// face along its own normal leaves its 2D segments untouched — so `dragged`
-// is prepared once by the caller and tested unchanged against every candidate.
-//
-// The candidate range is the model's extent on this axis (from the plane
-// index) plus three planes of headroom each way, enough to pull a face clear
-// of the assembly. Occupancy no longer prunes anything, so this only bounds
-// the work; dragBounds supplies the real travel limit. A boundary face plane
-// can lie anywhere from MIN to MAX+1 (the giant boundary cube spans world
-// volume [MIN, MAX+1]); never offer a landing plane outside it.
-export function computeAvailablePlanes(axis, excludeCoord, dragged, planeIndex, modelLo, modelHi) {
-  const values = [];
-  for (let v = Math.max(modelLo - 3, MIN); v <= Math.min(modelHi + 3, MAX + 1); v++) {
-    if (v === excludeCoord) continue;
-    const residents = planeIndex.get(v);
-    if (!residents) {
-      values.push(v); // an empty plane is always free
-      continue;
-    }
-    if (residents.every((resident) => !facesInterfere(dragged, resident))) values.push(v);
-  }
-  return values;
-}
-
 // The open interval (lo, hi) of edit-axis values a dragged face may move to
 // without any of its vertices overlapping a collinear skeleton edge, plus the
 // list of `impeders` — the barrier vertices themselves (world positions), for
@@ -269,49 +198,308 @@ export function dragBounds(axis, vertexIndices, skeleton) {
   return { lo, hi, impeders };
 }
 
-// A GRAPH-PRESERVING edit: move the named faces to `plane` along `axis` by
-// rewriting only their vertices' coordinates. The graph itself — edges,
-// faces, and the identity of every element — is carried forward BY REFERENCE,
-// because a face move changes the drawing and nothing else.
+// --- Face-swapping drag ----------------------------------------------------
+// A drag is a SEQUENCE OF DISCRETE STEPS, each moving the dragged face F to
+// the next plane it can legally occupy and swapping back whatever was in the
+// way. There is no continuous position: F's plane is always an integer, so the
+// drawing is a legal configuration at every instant of the gesture.
 //
-// This is what makes the keys durable. Re-deriving the graph from the filled
-// cubes would renumber the vertices (computeBrinkSkeleton sorts them
-// lexicographically, and the moved ones sort differently), invalidating every
-// key even though the graph is identical. Carrying it forward leaves each
-// index exactly where it was.
+// One step, moving F from plane P1 to a candidate plane P2, partitions each
+// plane's residents by whether they interfere with F's in-plane footprint —
+// the SAME footprint in both, since translating a face along its own normal
+// leaves its 2D segments untouched:
 //
-// Returns null if the move would place two vertices at the same point: that
-// is a graph-BREAKING merge, not something this path may quietly perform.
-export function applyGraphDrawingEdit(skeleton, faceKeys, axis, plane) {
-  const moved = new Set();
-  for (const key of faceKeys) {
-    const faceIdx = skeleton.byFaceKey.get(key);
-    if (faceIdx === undefined) return null; // names a face this skeleton lacks
-    for (const ei of skeleton.faces[faceIdx]) {
-      for (const vi of skeleton.edges[ei]) moved.add(vi);
+//                    | interferes with F | doesn't
+//   P1 (F's origin)  |   (empty)         |  A  stay-behinds
+//   P2 (destination) |   B  swappers     |  C  bystanders
+//
+// F and B trade planes; A and C never move. P1's "interferes" cell is empty by
+// INVARIANT — F occupies P1 legally, so nothing there interferes with it — and
+// the step re-establishes that invariant, which is what makes steps composable.
+//
+// Legality reduces to ONE condition: A must not interfere with B.
+//   - C is inert. P2 ends as C u {F}: C-vs-C is unchanged and C-vs-F is safe by
+//     C's own definition. C never blocks anything.
+//   - A u B is the only new pairing. A-vs-A and B-vs-B are unchanged (each set
+//     already shared a plane legally), but A and B have never met.
+// The asymmetry is structural: C is the set F JOINS, and C is defined by
+// non-interference with F, so that pairing is safe by construction. A is the
+// set B JOINS, and A is defined by its relationship to F, not to B — so it says
+// nothing about how A and B relate. F is protected by definition; A and B meet
+// unvetted.
+
+// The faces resident in each plane normal to `axis`, keyed and prepared, plus
+// the skeleton's vertex extent on that axis. Unlike buildPlaneFaceIndex this
+// KEEPS the dragged face and every face's key, because a swapping drag has to
+// move residents, not merely avoid them.
+//
+// The returned `index` is MUTATED as the drag steps (see applySwapStep): it is
+// the drag's live model of which face sits in which plane, so that each step
+// sees the arrangement the previous steps produced.
+export function buildSwapPlaneIndex(skeleton, axis) {
+  const index = new Map(); // plane coord -> [{ key, segs, bbox }]
+  for (let faceIdx = 0; faceIdx < skeleton.faces.length; faceIdx++) {
+    const projected = projectFace(skeleton, faceIdx, axis);
+    if (!projected) continue; // normal to one of the other two axes
+    if (!index.has(projected.coord)) index.set(projected.coord, []);
+    const prepared = prepareFace(projected.segments);
+    index.get(projected.coord).push({ key: skeleton.faceKeys[faceIdx], ...prepared });
+  }
+
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of skeleton.vertices) {
+    const v = Math.round(p[axis]);
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!Number.isFinite(lo)) {
+    lo = 0;
+    hi = 0;
+  }
+  return { index, lo, hi };
+}
+
+// The residents of `plane` other than the dragged face, split into those that
+// interfere with it and those that do not. Applied to F's own plane this yields
+// { interfering: [], nonInterfering: A } by the invariant above; applied to a
+// candidate it yields { interfering: B, nonInterfering: C }.
+export function partitionResidents(index, plane, dragged, draggedKey) {
+  const interfering = [];
+  const nonInterfering = [];
+  for (const resident of index.get(plane) ?? []) {
+    if (resident.key === draggedKey) continue; // F is not a resident to avoid
+    (facesInterfere(dragged, resident) ? interfering : nonInterfering).push(resident);
+  }
+  return { interfering, nonInterfering };
+}
+
+// Would any face in `a` interfere with any face in `b`? The step's whole
+// legality test, applied to A and B.
+export function setsInterfere(a, b) {
+  for (const fa of a) {
+    for (const fb of b) {
+      if (facesInterfere(fa, fb)) return true;
     }
+  }
+  return false;
+}
+
+// --- Gate 1: vertex impedance ----------------------------------------------
+// Independent of, and prior to, any swapping. A face's vertices travel along
+// their own drag-axis lines, and each may pass its own collinear partner (that
+// edge simply reverses) but no OTHER vertex on that line — doing so would make
+// the edge overlap its neighbor. See dragBounds for the pairing argument; this
+// is the same rule expressed as a per-face reach rather than as one interval
+// around the dragged face.
+//
+// `vertexPositions` is the LIVE vertex array, which a swapping drag rewrites as
+// it steps, so impedance is always measured against the current arrangement
+// rather than the one the drag started in.
+
+// Vertices grouped by the axis-parallel line they lie on, each list sorted
+// along `axis`. Rebuilt per step: a step moves vertices, so a cached grouping
+// would answer for a stale arrangement.
+export function groupVerticesByLine(vertexPositions, axis) {
+  const [ua, ub] = inPlaneAxes(axis);
+  const byLine = new Map(); // "u,v" -> [{ coord, point }] sorted by coord
+  for (const p of vertexPositions) {
+    const k = `${p[ua]},${p[ub]}`;
+    if (!byLine.has(k)) byLine.set(k, []);
+    byLine.get(k).push({ coord: p[axis], point: p });
+  }
+  for (const arr of byLine.values()) arr.sort((a, b) => a.coord - b.coord);
+  return byLine;
+}
+
+// The open interval (lo, hi) of edit-axis values the given vertices may move
+// to, plus the barrier vertices themselves for highlighting. Same rule as
+// dragBounds, but taking a prebuilt line grouping so a scan can reuse it, and
+// taking vertex POSITIONS rather than a skeleton.
+export function reachOnLines(byLine, axis, vertexIndices, vertexPositions) {
+  const [ua, ub] = inPlaneAxes(axis);
+  let lo = -Infinity;
+  let hi = Infinity;
+  const impeders = [];
+  for (const vi of vertexIndices) {
+    const p = vertexPositions[vi];
+    const line = byLine.get(`${p[ua]},${p[ub]}`);
+    if (!line) continue;
+    // Locate the {V, W} pair on the line. Edges pair consecutive vertices
+    // (1st-2nd, 3rd-4th, ...), so the pair's start index is even.
+    const i = line.findIndex((e) => e.coord === p[axis]);
+    if (i === -1) continue;
+    const pairStart = i - (i % 2);
+    const below = pairStart - 1 >= 0 ? line[pairStart - 1] : null;
+    const above = pairStart + 2 < line.length ? line[pairStart + 2] : null;
+    if (below) {
+      if (below.coord > lo) lo = below.coord;
+      impeders.push(below.point);
+    }
+    if (above) {
+      if (above.coord < hi) hi = above.coord;
+      impeders.push(above.point);
+    }
+  }
+  return { lo, hi, impeders };
+}
+
+// --- The step: scan, skip, swap --------------------------------------------
+
+// The skeleton vertex indices belonging to the named face.
+export function faceVertexIndices(skeleton, faceKey) {
+  const faceIdx = skeleton.byFaceKey.get(faceKey);
+  if (faceIdx === undefined) return null;
+  const indices = new Set();
+  for (const ei of skeleton.faces[faceIdx]) {
+    for (const vi of skeleton.edges[ei]) indices.add(vi);
+  }
+  return [...indices];
+}
+
+// Plan ONE step of a swapping drag: move F one plane in `dir` (+1/-1), or as
+// far as the first plane it can legally occupy.
+//
+// SKIPPING. When A-vs-B blocks a candidate, the drag does NOT stop. That plane
+// is dropped from consideration and the swap is retried against the next one
+// out; the blocked plane keeps its contents and becomes an INERT LAYER F passes
+// over. "Adjacent" was never the operative property — what a swap needs is that
+// origin and destination be CONSECUTIVE AMONG THE PLANES F CAN LEGALLY OCCUPY.
+//
+// A skipped plane is inert as an OCCUPANCY question (no face enters or leaves
+// it, so it contributes no pair to check) but live as a TRAVEL question: both
+// F's forward vertices and B's backward vertices must clear it. B is what makes
+// this matter — once a plane is skipped, B has to traverse an occupied plane to
+// reach F's origin, which in the adjacent case it never did.
+//
+// B is recomputed per candidate. The scan is therefore not "find a legal plane"
+// but "find a plane whose OWN interferers can survive in P1".
+//
+// Returns { plane, swapKeys, impeders } for the first legal candidate, or null
+// when the scan is walled off (vertex impedance, or running out of model).
+export function planSwapStep(skeleton, axis, draggedKey, dragged, index, dir, limits) {
+  const { lo: modelLo, hi: modelHi } = limits;
+  const fromPlane = planeOfFace(skeleton, axis, draggedKey);
+  if (fromPlane === null) return null;
+
+  const fVertices = faceVertexIndices(skeleton, draggedKey);
+  if (!fVertices) return null;
+
+  // A is fixed for the whole scan: it is what stays behind in F's own plane,
+  // and no candidate changes it.
+  const { nonInterfering: A } = partitionResidents(index, fromPlane, dragged, draggedKey);
+
+  const byLine = groupVerticesByLine(skeleton.vertices, axis);
+  // Gate 1 for F itself. F cannot travel past its own collinear neighbors no
+  // matter which candidate it aims for, so this bounds the entire scan.
+  const fReach = reachOnLines(byLine, axis, fVertices, skeleton.vertices);
+
+  // Scan outward. The range is the model's extent plus headroom enough to pull
+  // a face clear of the assembly, clamped to the world volume [MIN, MAX+1] that
+  // a boundary face plane may occupy.
+  const first = fromPlane + dir;
+  const last = dir > 0 ? Math.min(modelHi + 3, MAX + 1) : Math.max(modelLo - 3, MIN);
+  for (let plane = first; dir > 0 ? plane <= last : plane >= last; plane += dir) {
+    // Gate 1, F: a hard wall. Beyond it no candidate is reachable, so the scan
+    // ends rather than continuing past.
+    if (!(plane > fReach.lo && plane < fReach.hi)) return null;
+
+    const { interfering: B } = partitionResidents(index, plane, dragged, draggedKey);
+
+    // Gate 2: the one condition. A blocked candidate is SKIPPED, not fatal.
+    if (setsInterfere(A, B)) continue;
+
+    // Gate 1, B: each swapper travels backward to F's plane, and once planes
+    // have been skipped that path crosses occupied ground.
+    let blocked = false;
+    const swapKeys = [];
+    for (const b of B) {
+      const bVertices = faceVertexIndices(skeleton, b.key);
+      if (!bVertices) {
+        blocked = true;
+        break;
+      }
+      const bReach = reachOnLines(byLine, axis, bVertices, skeleton.vertices);
+      if (!(fromPlane > bReach.lo && fromPlane < bReach.hi)) {
+        blocked = true;
+        break;
+      }
+      swapKeys.push(b.key);
+    }
+    // A swapper that cannot make the trip blocks this candidate the same way an
+    // A-vs-B collision does: skip it and try the next plane out.
+    if (blocked) continue;
+
+    return { plane, from: fromPlane, swapKeys, impeders: fReach.impeders };
+  }
+  return null; // ran out of model
+}
+
+// The edit-axis plane the named face currently lies in, or null if the face is
+// not normal to `axis` (or is absent).
+export function planeOfFace(skeleton, axis, faceKey) {
+  const faceIdx = skeleton.byFaceKey.get(faceKey);
+  if (faceIdx === undefined) return null;
+  const projected = projectFace(skeleton, faceIdx, axis);
+  return projected ? projected.coord : null;
+}
+
+// Apply a planned step: F to `plane`, its swappers back to `from`, in ONE
+// rewrite of the vertex array. Both moves must happen together — applying them
+// as two successive graph-preserving edits would pass through an intermediate
+// state where F and B share a plane, which is exactly the interference the swap
+// exists to resolve, and the coincident-vertex check would reject it.
+//
+// The graph — edges, faces, keys — is carried forward BY REFERENCE: a swap
+// changes the drawing and nothing else. That is what makes the keys durable.
+// Re-deriving the graph from the filled cubes would renumber the vertices
+// (computeBrinkSkeleton sorts them lexicographically, and the moved ones sort
+// differently), invalidating every key even though the graph is identical.
+//
+// Returns the new skeleton, or null if the move would fuse two vertices.
+export function applySwapStep(skeleton, axis, draggedKey, step) {
+  const { plane, from, swapKeys } = step;
+  const forward = faceVertexIndices(skeleton, draggedKey);
+  if (!forward) return null;
+  const moved = new Map(); // vertex index -> its new edit-axis coordinate
+  for (const vi of forward) moved.set(vi, plane);
+  for (const key of swapKeys) {
+    const backward = faceVertexIndices(skeleton, key);
+    if (!backward) return null;
+    for (const vi of backward) moved.set(vi, from);
   }
 
   const vertices = skeleton.vertices.map((p, vi) => {
-    if (!moved.has(vi)) return [p[0], p[1], p[2]];
     const q = [p[0], p[1], p[2]];
-    q[axis] = plane;
+    if (moved.has(vi)) q[axis] = moved.get(vi);
     return q;
   });
 
-  // For the face-drag caller this is now belt-and-braces, and provably so:
-  // computeAvailablePlanes only offers planes where the arriving cycle
-  // touches nothing, and a coincident vertex is necessarily a touch. Every
-  // vertex at coordinate `plane` has degree exactly 2 within that plane (see
-  // brinkSkeleton.js's face construction), so it belongs to some resident
-  // cycle the index tested; and a point shared with the arriving cycle is an
-  // endpoint of an edge on BOTH sides, which is never the strictly-interior
-  // proper crossing the interference rule permits. The check stays because it
-  // is cheap, it guards the general multi-face signature, and a silent vertex
-  // fusion would be unrecoverable.
   const distinct = new Set(vertices.map((p) => `${p[0]},${p[1]},${p[2]}`));
   if (distinct.size !== vertices.length) return null; // would fuse vertices
 
   return { ...skeleton, vertices };
 }
 
+// Move faces between planes in the drag's live plane index, mirroring what
+// applySwapStep did to the skeleton. Keeping the index in step is what lets the
+// NEXT step see the arrangement this one produced — the relabelling that makes
+// a drag a repeated application of one local rule.
+export function updateSwapIndex(index, step, draggedKey) {
+  const { plane, from, swapKeys } = step;
+  const moving = new Set([draggedKey, ...swapKeys]);
+  const lifted = [];
+  for (const [coord, residents] of index) {
+    const keep = [];
+    for (const resident of residents) {
+      if (moving.has(resident.key)) lifted.push(resident);
+      else keep.push(resident);
+    }
+    if (keep.length !== residents.length) index.set(coord, keep);
+  }
+  for (const resident of lifted) {
+    const target = resident.key === draggedKey ? plane : from;
+    if (!index.has(target)) index.set(target, []);
+    index.get(target).push(resident);
+  }
+}

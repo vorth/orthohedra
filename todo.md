@@ -3,8 +3,6 @@
 ## must have
 
 - better topology metrics
-- face picking by construction, and user disambiguation
-- change face drag to plane swap + plane sharing
 - graph-preserving and -breaking modes
 
 ## nice to have

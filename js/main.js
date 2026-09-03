@@ -6,10 +6,12 @@ import {
   pointSegDist2,
   prepareFace,
   projectFace,
-  buildPlaneFaceIndex,
-  computeAvailablePlanes,
   dragBounds,
-  applyGraphDrawingEdit,
+  buildSwapPlaneIndex,
+  planSwapStep,
+  applySwapStep,
+  updateSwapIndex,
+  planeOfFace,
 } from "./faceGeometry.js";
 import { createRealizer } from "./realization.js";
 import {
@@ -129,7 +131,7 @@ async function main() {
   // both graph-preserving and graph-breaking edits.
   //
   // No deep copy is needed: every producer of a skeleton (computeBrinkSkeleton,
-  // applyGraphDrawingEdit) returns a fresh object with a fresh vertices array,
+  // applySwapStep) returns a fresh object with a fresh vertices array,
   // and nothing mutates a skeleton in place.
   const history = { entries: [], index: -1 }; // entries[index] is the current state
 
@@ -380,7 +382,7 @@ async function main() {
   // topology readout, rebuild the cube-face geometry, and persist. Deliberately
   // does NOT derive the graph — a graph-preserving edit already holds the
   // graph, and re-deriving it would be both wasteful and lossy (see
-  // applyGraphDrawingEdit).
+  // applySwapStep).
   //
   // `record` is explicit rather than inferred: this function is also called for
   // non-edits — resyncing the render after a failed drag, and seeding the
@@ -545,7 +547,7 @@ async function main() {
     // Rendering is decoupled from the move gesture: face visibility stays in
     // effect whether or not move mode is active.
     if (!on) {
-      view.hideAvailablePlanes();
+      // nothing to tear down: the drag's visuals are cleared by cancelDrag
     } else {
       // Leaving Build/Destroy: drop their active styling and status.
       buildBtn.classList.remove('active');
@@ -603,8 +605,9 @@ async function main() {
   }
 
   // --- Move-mode drag state and geometry -----------------------------------
-  const SNAP_THRESHOLD = 0.3; // commit only if drag value is within this of a plane
-  let drag = null; // { axis, face, skeleton, planes, linePoint, dragValue }
+  // { axis, face, dragged, index, limits, baseSkeleton, skeleton, steps,
+  //   linePoint, dragValue }
+  let drag = null;
   // A grabbed-but-trapped face (grabbable, but with no legal destination): the
   // gesture is consumed and its impeders shown, but there is no live drag.
   let trapped = false;
@@ -638,48 +641,96 @@ async function main() {
     return linePoint[axis] + t;
   }
 
-  function nearestPlane(value, planes) {
-    let best = null;
-    let bestDist = Infinity;
-    for (const p of planes) {
-      const dist = Math.abs(p - value);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = p;
-      }
-    }
-    return { plane: best, dist: bestDist };
+  // --- The swapping drag ---------------------------------------------------
+  // A drag is a SEQUENCE OF DISCRETE STEPS applied to live state, not a
+  // continuous slide with snap zones. The pointer moves continuously, but the
+  // dragged face's plane is always an INTEGER: crossing a threshold fires a
+  // step, which moves the face to the next plane it can legally occupy and
+  // swaps whatever was in the way back into the plane it left. The drawing is
+  // therefore a legal configuration at every instant of the gesture, which is
+  // what lets the skeleton itself follow the drag — there is no half-way state
+  // to render.
+  //
+  // A plane the scan SKIPS (see planSwapStep) is a plane the face never
+  // occupies for any pointer position, so it "snaps past": the two-plane jump
+  // is the feedback, needing no special rendering.
+
+  // Fire a step when the pointer passes this fraction of the way to the
+  // candidate plane. Below 0.5 stepping forward and stepping back have
+  // different thresholds, which is the HYSTERESIS that stops the face
+  // chattering when the pointer sits near a boundary.
+  const STEP_THRESHOLD = 0.6;
+
+  // Advance the drag by one step in `dir`, if the pointer has moved far enough
+  // and a legal destination exists. Returns true if a step was applied.
+  function trySwapStep(dir) {
+    const { axis, face, dragValue, index, limits, dragged } = drag;
+    const from = planeOfFace(drag.skeleton, axis, face.key);
+    if (from === null) return false;
+    // Has the pointer actually reached toward the next plane?
+    if (dir > 0 ? dragValue < from + STEP_THRESHOLD : dragValue > from - STEP_THRESHOLD) return false;
+
+    const step = planSwapStep(drag.skeleton, axis, face.key, dragged, index, dir, limits);
+    if (!step) return false;
+    // Don't step past where the pointer actually is: a skip can jump several
+    // planes, and overshooting the pointer would run away from the gesture.
+    if (dir > 0 ? step.plane > dragValue + 1 : step.plane < dragValue - 1) return false;
+
+    const next = applySwapStep(drag.skeleton, axis, face.key, step);
+    if (!next) return false; // would fuse vertices: treat as a wall
+
+    updateSwapIndex(index, step, face.key);
+    drag.skeleton = next;
+    drag.steps.push(step);
+    return true;
+  }
+
+  // Undo the most recent step. Reverse POPS the stack rather than re-scanning:
+  // a backward scan is not guaranteed to reproduce the forward step's partner,
+  // because the scan is direction-relative and the swappers have changed planes
+  // (forward may skip a plane that backward would accept, stranding them). See
+  // dev-docs/face-swap-drag.md.
+  function undoSwapStep() {
+    const { axis, face, dragValue, index } = drag;
+    const step = drag.steps[drag.steps.length - 1];
+    if (!step) return false;
+    // Only retreat once the pointer has come back past the plane we left.
+    const back = step.plane > step.from;
+    if (back ? dragValue > step.plane - STEP_THRESHOLD : dragValue < step.plane + STEP_THRESHOLD) return false;
+
+    // The inverse step: the face returns to `from`, its swappers to `plane`.
+    const inverse = { plane: step.from, from: step.plane, swapKeys: step.swapKeys };
+    const prev = applySwapStep(drag.skeleton, axis, face.key, inverse);
+    if (!prev) return false;
+
+    updateSwapIndex(index, inverse, face.key);
+    drag.skeleton = prev;
+    drag.steps.pop();
+    return true;
   }
 
   function startDrag(axis, hitId, hitPoint) {
     const face = connectedFace(axis, hitId, hitPoint);
     if (!face) return false; // not a grabbable face: let the gesture rotate the camera
-    // Candidate destination planes — those where the arriving cycle would touch
-    // none of the plane's residents — then discard any that would drive a
-    // dragged vertex past a collinear neighbor on its DRAG-AXIS line
-    // (overlapping the neighboring edge). The two constraints are independent:
-    // the in-plane interference test cannot see an overlap along the drag axis,
-    // and dragBounds cannot see one within the destination plane.
+
+    // The drag's live model of which face sits in which plane. It is MUTATED
+    // as steps are applied, so each step sees the arrangement the previous
+    // steps produced — the relabelling that makes a drag a repeated
+    // application of one local rule.
+    const { index, lo, hi } = buildSwapPlaneIndex(currentSkeleton, axis);
     const dragged = prepareFace(face.segments);
-    const { index, lo: modelLo, hi: modelHi } = buildPlaneFaceIndex(currentSkeleton, axis, face.key);
-    const { lo, hi, impeders } = dragBounds(axis, face.vertexIndices, currentSkeleton);
-    const values = computeAvailablePlanes(axis, face.coord, dragged, index, modelLo, modelHi)
-      .filter((v) => v > lo && v < hi);
-    if (!values.length) {
-      // The face is grabbable but boxed in by its collinear neighbors, so there
-      // is nowhere legal to move. Still CONSUME the gesture (suspend the
+    const limits = { lo, hi };
+
+    // Can the face move at all, in either direction? Under swapping, a plane
+    // holding faces is no longer a barrier — only vertex impedance is — so
+    // "trapped" now means genuinely boxed in by collinear neighbors.
+    const forward = planSwapStep(currentSkeleton, axis, face.key, dragged, index, 1, limits);
+    const backward = planSwapStep(currentSkeleton, axis, face.key, dragged, index, -1, limits);
+    if (!forward && !backward) {
+      // Grabbable but boxed in. Still CONSUME the gesture (suspend the
       // trackball) and show the impeders, so it reads as "trapped, here's why"
-      // instead of an unexpected camera rotation. No live `drag`:
-      // pointermove/up just clear the preview.
-      //
-      // The impeders are a COMPLETE explanation: interference alone can never
-      // empty this list. The candidate range always reaches modelHi + 1 and
-      // modelLo - 1, where no skeleton vertex — hence no resident face —
-      // exists, so those two planes are unconditionally interference-free.
-      // Only dragBounds can cut them off (or, for a model pressed against the
-      // world wall, the MIN/MAX clamp, where inBounds is already the operative
-      // constraint). Interference can still punch holes in the middle of the
-      // reachable interval; it just cannot close both ends.
+      // instead of an unexpected camera rotation.
+      const { impeders } = dragBounds(axis, face.vertexIndices, currentSkeleton);
       trapped = true;
       view.setControlsEnabled(false);
       view.showImpeders(impeders);
@@ -697,73 +748,127 @@ async function main() {
     drag = {
       axis,
       face,
-      skeleton: currentSkeleton, // the graph the drag edits, resolved by face key at commit
-      planes: values,
+      dragged,
+      index,
+      limits,
+      baseSkeleton: currentSkeleton, // the graph as it stood before the gesture
+      skeleton: currentSkeleton, // rewritten in place as steps are applied
+      steps: [], // the applied steps, popped on reverse and committed on release
       linePoint,
       dragValue: face.coord,
     };
     view.setControlsEnabled(false);
-    view.showAvailablePlanes(axis, values, face.segments);
-    view.showImpeders(impeders);
-    view.renderDragIndicator(axis, face.segments, face.coord, false);
+    view.showImpeders((forward ?? backward).impeders);
+    view.renderBrinkSkeleton(drag.skeleton);
+    view.showGrabbedFace(axis, face.segments, face.coord);
     return true;
   }
 
+  // Redraw the model mid-drag, after a step has rewritten the drawing. The
+  // cubes are refilled along with the skeleton: without them the drag is too
+  // confusing to read, since the shell is the shape you are actually editing.
+  //
+  // This is the per-STEP cost, not the per-pointermove cost — steps fire only
+  // on plane crossings. It deliberately does NOT go through adoptSkeleton:
+  // history and localStorage belong to the commit, not to each intermediate
+  // state of a gesture in flight. `currentSkeleton` is left alone too; the
+  // drag owns its own drawing until it commits.
+  //
+  // Bulk voxel rules from CLAUDE.md apply: raw primitives only, and exactly one
+  // render at the end.
+  function redrawDragStep() {
+    let cubes;
+    try {
+      cubes = dropOutOfBounds(fillCubesFromSkeleton(drag.skeleton));
+    } catch (error) {
+      // A step that cannot be filled still has a valid skeleton, so show that
+      // much rather than dropping the frame entirely.
+      console.error('Face drag: could not refill cubes for this step:', error);
+      view.renderBrinkSkeleton(drag.skeleton);
+      return;
+    }
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+    view.renderBrinkSkeleton(drag.skeleton);
+    view.renderBoundaryCubeFaces(positions);
+  }
+
   function updateDrag(clientX, clientY) {
-    const value = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
-    drag.dragValue = value;
-    const { plane, dist } = nearestPlane(value, drag.planes);
-    // Within the snap threshold the indicator snaps to the plane and brightens
-    // (a release would commit there); otherwise it follows the raw value so
-    // dragging past a plane can reach the next one.
-    const snapped = dist <= SNAP_THRESHOLD;
-    view.renderDragIndicator(drag.axis, drag.face.segments, snapped ? plane : value, snapped);
+    drag.dragValue = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
+
+    // Apply as many steps as the pointer has earned. The loop matters: a fast
+    // pointer move can cross several planes between two pointermove events.
+    // Retreat is tried first, and only one direction can make progress at a
+    // time, so the two loops cannot fight.
+    let changed = false;
+    while (undoSwapStep()) changed = true;
+    if (!changed) {
+      const dir = drag.dragValue > planeOfFace(drag.skeleton, drag.axis, drag.face.key) ? 1 : -1;
+      while (trySwapStep(dir)) changed = true;
+    }
+    // The skeleton and the cubes only change when a step fires, so rebuild
+    // them only then — NOT per pointermove.
+    if (changed) redrawDragStep();
+
+    // The OUTLINE, by contrast, follows the pointer continuously — it is drawn
+    // at the raw drag value, not at the face's integer plane. That continuous
+    // motion is the drag's feedback: the outline leads, and the skeleton snaps
+    // to it a step at a time. Without it the gesture has nothing tracking the
+    // pointer between steps and reads as unresponsive.
+    view.moveGrabbedFace(drag.axis, drag.face.segments, drag.dragValue);
   }
 
   function commitDrag() {
-    const { axis, face, skeleton, dragValue, planes } = drag;
-    const { plane, dist } = nearestPlane(dragValue, planes);
+    const { skeleton, steps, baseSkeleton } = drag;
+    const moved = steps.length > 0;
     endDrag();
-    if (plane === null || dist > SNAP_THRESHOLD) return; // not near a plane: cancel
-    if (plane === face.coord) return;
-
-    // A graph-preserving edit: shift the dragged face's vertices to the target
-    // plane, keeping the graph itself. The face is named by KEY — by its edge
-    // cycle rather than by position in the face array — so we move the face we
-    // grabbed or nothing at all, never whichever face inherited its index.
-    const modifiedSkeleton = applyGraphDrawingEdit(skeleton, [face.key], axis, plane);
-    if (!modifiedSkeleton) {
-      console.warn('Face drag: the move is not graph-preserving; ignoring the drag.');
-      adoptSkeleton(skeleton); // resync render to the unchanged skeleton
+    if (!moved) {
+      // No step ever fired, so nothing moved and `skeleton` is still
+      // `baseSkeleton`. The skeleton meshes were never rewritten either (only
+      // an applied step redraws them), so there is nothing to resync — a plain
+      // click in move mode must not cost a boundary-face rebuild or an
+      // autosave.
       return;
     }
 
-    try {
-      // Cubes are derived purely to render, pick, and export — they are not
-      // consulted to rebuild the graph, so `adoptSkeleton` (not
-      // `updateBrinkSkeleton`) takes the graph we already hold.
-      const cubes = dropOutOfBounds(fillCubesFromSkeleton(modifiedSkeleton));
-      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
-      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
-      adoptSkeleton(modifiedSkeleton, { record: true, label: 'Move face' });
-      updateStatus(mode);
-    } catch (error) {
-      console.error('Face drag failed while re-filling from skeleton:', error);
-      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
-    }
+    // `positions` is ALREADY correct: redrawDragStep refilled it after the last
+    // applied step, and no step is left unrendered. So the commit does not
+    // refill — it only does the things a gesture in flight deliberately skips:
+    // adopt the drawing as current, record one history entry for the whole
+    // gesture, and persist.
+    //
+    // Cubes are derived purely to render, pick, and export — they are not
+    // consulted to rebuild the graph, so `adoptSkeleton` (not
+    // `updateBrinkSkeleton`) takes the graph we already hold.
+    adoptSkeleton(skeleton, { record: true, label: 'Move face' });
+    updateStatus(mode);
   }
 
   function endDrag() {
     drag = null;
     trapped = false;
     view.setControlsEnabled(true);
-    view.hideDragIndicator();
-    view.hideAvailablePlanes();
+    view.hideGrabbedFace();
     view.hideImpeders();
   }
 
   function cancelDrag() {
+    // A live drag has already rewritten BOTH the rendered skeleton and the
+    // voxel set in place, so abandoning it must put the pre-gesture drawing
+    // back and refill the cubes from it — the steps are discarded wholesale
+    // rather than popped one at a time.
+    const restore = drag && drag.steps.length ? drag.baseSkeleton : null;
     if (drag || trapped) endDrag();
+    if (!restore) return;
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(restore));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+      adoptSkeleton(restore);
+    } catch (error) {
+      console.error('Face drag: could not restore cubes after cancel:', error);
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
+    }
   }
 
   buildBtn.addEventListener('click', () => setMode('build'));
