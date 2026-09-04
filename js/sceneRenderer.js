@@ -69,22 +69,29 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
   const hemiLight = new THREE.HemisphereLight(0xa8c7ff, 0x1f2a3f, 0.55);
   scene.add(hemiLight);
 
-  // Attached to the camera (rather than the scene) so they move with
-  // the viewer as the camera orbits, instead of staying fixed in world
-  // space. A DirectionalLight shines toward `target`, which defaults
-  // to the world origin — parent the target to the camera too (at its
-  // local look-at point) so the light direction stays camera-relative.
-  const keyLight = new THREE.DirectionalLight(0xfff2dd, 1.2);
-  keyLight.position.set(6, 9, 4);
-  camera.add(keyLight);
-  camera.add(keyLight.target);
-  keyLight.target.position.set(0, 0, -1);
-
-  const fillLight = new THREE.DirectionalLight(0xa8d7ff, 0.45);
-  fillLight.position.set(-5, 3, -7);
-  camera.add(fillLight);
-  camera.add(fillLight.target);
-  fillLight.target.position.set(0, 0, -1);
+  // Three key lights attached to the camera (rather than the scene) so they
+  // move with the viewer as the camera orbits, instead of staying fixed in
+  // world space. Their directions are spaced 120 degrees apart around the
+  // line of sight and tilted forward toward the viewer, so every face that
+  // is visible at all catches at least one of them at a decent angle.
+  // A DirectionalLight shines toward `target`, which defaults to the world
+  // origin — parent each target to the camera too (at its local look-at
+  // point) so the light directions stay camera-relative.
+  const LIGHT_RING_RADIUS = 7;   // lateral offset in the camera's XY plane
+  const LIGHT_RING_FORWARD = 5;  // how far toward the viewer (camera +Z)
+  const LIGHT_PHASE = Math.PI / 2; // first light straight up, then 120 apart
+  for (let i = 0; i < 3; i++) {
+    const angle = LIGHT_PHASE + (i * 2 * Math.PI) / 3;
+    const light = new THREE.DirectionalLight(0xfff4e8, 0.85);
+    light.position.set(
+      LIGHT_RING_RADIUS * Math.cos(angle),
+      LIGHT_RING_RADIUS * Math.sin(angle),
+      LIGHT_RING_FORWARD,
+    );
+    camera.add(light);
+    camera.add(light.target);
+    light.target.position.set(0, 0, -1);
+  }
 
   scene.add(camera);
 
