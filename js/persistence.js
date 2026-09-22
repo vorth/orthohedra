@@ -80,9 +80,15 @@ export function parseSavedState(raw) {
       : LEGACY_RENDER_MODE_VISIBILITY[parsed.renderMode] ?? [FACE_SOLID, FACE_SOLID, FACE_SOLID];
 
     const isVector3Array = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
+    // `up` is optional: states saved before it was persisted lack it, and
+    // setCameraState re-derives a valid one in that case. Drop a malformed
+    // `up` rather than the whole camera, so a bad value degrades to the
+    // re-derive path instead of losing position/target too.
     const cameraState =
       parsed.camera && isVector3Array(parsed.camera.position) && isVector3Array(parsed.camera.target)
-        ? parsed.camera
+        ? (isVector3Array(parsed.camera.up)
+            ? parsed.camera
+            : { position: parsed.camera.position, target: parsed.camera.target })
         : null;
 
     // The skeleton is present only in saved files (not autosave). Validate

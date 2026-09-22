@@ -535,14 +535,37 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
   };
 
   // --- Camera / viewport ---------------------------------------------------
+  // `up` is part of the camera state, not a constant. TrackballControls is a
+  // true trackball: _rotateCamera applies its rotation to camera.up as well as
+  // to the eye vector, so up is re-derived continuously and is the real
+  // screen-up direction. _panCamera builds both of its pan axes from it
+  // (eye x up for horizontal, up itself for vertical), which is only correct
+  // while up stays perpendicular to the eye vector. Restoring position/target
+  // without up leaves up at the default (0,1,0), inconsistent with the restored
+  // orientation — panning then skews and partly dollies instead of moving in
+  // the viewport plane.
   const getCameraState = () => ({
     position: camera.position.toArray(),
     target: controls.target.toArray(),
+    up: camera.up.toArray(),
   });
 
-  function setCameraState({ position, target }) {
+  function setCameraState({ position, target, up }) {
     camera.position.fromArray(position);
     controls.target.fromArray(target);
+    // Older saved states predate `up`; re-derive a perpendicular one so the
+    // trackball invariant holds either way.
+    if (up) {
+      camera.up.fromArray(up);
+    } else {
+      const eye = camera.position.clone().sub(controls.target);
+      const side = new THREE.Vector3().crossVectors(camera.up, eye);
+      // Degenerate only if the stored up is parallel to the eye vector; any
+      // perpendicular will do there, so fall back to a world axis.
+      if (side.lengthSq() < 1e-12) side.crossVectors(new THREE.Vector3(1, 0, 0), eye);
+      if (side.lengthSq() < 1e-12) side.crossVectors(new THREE.Vector3(0, 0, 1), eye);
+      camera.up.crossVectors(eye, side).normalize();
+    }
     controls.update();
   }
 
