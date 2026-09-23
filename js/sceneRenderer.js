@@ -166,6 +166,36 @@ export function createSceneRenderer(app) {
     return grown;
   }
 
+  // A flat square OUTLINE (border only, no fill) as real triangulated
+  // geometry: four thin rectangular strips around the perimeter, meeting at
+  // mitered corners, with nothing spanning the open middle. Unlike a
+  // wireframe-rendered PlaneGeometry — which draws the diagonal shared by its
+  // two triangles along with the real edges — this has no diagonal to draw,
+  // because there IS no cross-square triangle. Centered on the origin in the
+  // XY plane, facing +Z, so it composes with the same per-axis quaternions
+  // used for the solid cube faces.
+  function makeSquareOutlineGeometry(size, thickness) {
+    const o = size / 2; // outer half-extent
+    const i = o - thickness; // inner half-extent
+    // 8 corners: outer ring then inner ring, each starting top-right, going
+    // counter-clockwise (+X,+Y) -> (-X,+Y) -> (-X,-Y) -> (+X,-Y).
+    const positions = new Float32Array([
+      o, o, 0, -o, o, 0, -o, -o, 0, o, -o, 0, // outer 0-3
+      i, i, 0, -i, i, 0, -i, -i, 0, i, -i, 0, // inner 4-7
+    ]);
+    // Two triangles per side of the frame, winding consistent with the outer
+    // ring's CCW order so the border reads as one continuous strip.
+    const index = [];
+    for (let k = 0; k < 4; k++) {
+      const oA = k, oB = (k + 1) % 4, iA = 4 + k, iB = 4 + ((k + 1) % 4);
+      index.push(oA, oB, iB, oA, iB, iA);
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setIndex(index);
+    return geometry;
+  }
+
   const faceGeometry = new THREE.PlaneGeometry(1, 1);
   // Each axis's faces are tinted with that axis's FACE_COLORS shade (X red,
   // Y yellow, Z blue, lightened slightly toward white).
@@ -186,9 +216,50 @@ export function createSceneRenderer(app) {
     return mesh;
   });
 
-  // Per-instance metadata for the current boundary faces, one array per
-  // axis mesh, indexed the same as that mesh's instances.
+  // Black square outlines on each boundary face, for Cubes mode (which shows
+  // no skeleton edges — see setSkeletonVisible/setCubeEdgesVisible). Built
+  // from the diagonal-free frame geometry above, so — unlike a
+  // wireframe-rendered plane — no diagonal is drawn. Not pickable (never
+  // passed to getIntersection).
+  //
+  // The frame sits exactly coplanar with the solid face it outlines (same
+  // per-instance transform, no normal offset — the geometry is instanced
+  // across all three axes' quaternions, so there's no single "outward"
+  // direction to bake into a per-vertex nudge). Coplanar geometry z-fights:
+  // the GPU's depth test can't consistently decide which layer wins, so
+  // pixels along the border flicker between the two — the "sketchy" look.
+  // `polygonOffset` fixes this at the rasterizer level (nudges the DEPTH
+  // VALUE used for the test, not the vertex position), which is the standard
+  // fix for exactly this decal-over-surface case and works at any viewing
+  // angle/distance, unlike a fixed geometric offset.
+  const cubeEdgeGeometry = makeSquareOutlineGeometry(1, 0.03);
+  const cubeEdgeMaterial = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  const cubeEdgeMeshes = [0, 1, 2].map(() => {
+    const mesh = makeInstancedMesh(cubeEdgeGeometry, cubeEdgeMaterial, INITIAL_INSTANCES);
+    mesh.visible = false;
+    scene.add(mesh);
+    return mesh;
+  });
+
+  // Per-instance metadata for the current boundary faces, one array per axis
+  // mesh, indexed the same as that mesh's instances — kept for full rebuilds
+  // (renderBoundaryCubeFaces) and picking (boundaryFaceInfo).
   let boundaryFaceInfoByAxis = [[], [], []];
+
+  // Per-axis-mesh slot bookkeeping for INCREMENTAL boundary-face updates (see
+  // addBoundaryFace/removeBoundaryFace below), used by a cubes-mode drag step
+  // instead of a full renderBoundaryCubeFaces rescan. Swap-pop, exactly like
+  // main.js's `positions`/`occupied`: `faceSlotByAxis[axis]` maps a face's key
+  // ("x,y,z,sign") to its instance index in that axis's mesh, so both a
+  // single add and a single remove are O(1) instead of O(all boundary faces).
+  const faceKey = (x, y, z, sign) => `${x},${y},${z},${sign}`;
+  const faceSlotByAxis = [new Map(), new Map(), new Map()];
 
   const faceTempMatrix = new THREE.Matrix4();
   // Reused across all face instances so a large model (tens of thousands of
@@ -220,25 +291,146 @@ export function createSceneRenderer(app) {
       const axisFaces = byAxis[axis];
       const mesh = ensureInstanceCapacity(cubeFaceMeshes, axis, axisFaces.length);
       mesh.count = axisFaces.length;
+      const edgeMesh = ensureInstanceCapacity(cubeEdgeMeshes, axis, axisFaces.length);
+      edgeMesh.count = axisFaces.length;
+      const slots = new Map();
+      faceSlotByAxis[axis] = slots;
       for (let i = 0; i < axisFaces.length; i++) {
-        const { sign, center } = axisFaces[i];
+        const { x, y, z, sign, center } = axisFaces[i];
         const signIdx = sign === 1 ? 0 : 1;
         faceTempPosition.set(center[0], center[1], center[2]);
         faceTempMatrix.compose(faceTempPosition, faceQuaternions[axis][signIdx], faceTempScale);
         mesh.setMatrixAt(i, faceTempMatrix);
+        edgeMesh.setMatrixAt(i, faceTempMatrix);
+        slots.set(faceKey(x, y, z, sign), i);
       }
       mesh.instanceMatrix.needsUpdate = true;
+      edgeMesh.instanceMatrix.needsUpdate = true;
       // InstancedMesh caches a bounding sphere for raycasting that isn't
       // automatically invalidated when instances move or `count`
       // changes — recompute it here or hover/click detection can
-      // intermittently miss instances outside the stale bounds.
+      // intermittently miss instances outside the stale bounds. Only the
+      // solid face mesh is ever raycast (edges are never picked).
       mesh.computeBoundingSphere();
+    }
+    // A full rebuild already resyncs everything the incremental path below
+    // would otherwise need to catch up on.
+    dirtyBoundaryAxes.clear();
+  }
+
+  // --- Incremental boundary-face updates ------------------------------------
+  // A cubes-mode drag toggles ONE cube per step; recomputing the whole
+  // boundary (renderBoundaryCubeFaces, O(every cube in the model)) on every
+  // step visibly lags on large models. These add/remove one instance at a
+  // time — O(1) — using the same swap-pop trick as main.js's `positions`.
+  //
+  // None of these recompute the meshes' bounding spheres (computeBoundingSphere
+  // is itself O(current instance count), so doing it on every one of a drag's
+  // many single-face updates would reintroduce the same O(N)-per-step cost).
+  // Picking is never raycast mid-drag, only before the next one starts, so a
+  // stale bounding sphere is harmless until then — call
+  // finalizeBoundaryFaces() once after a batch of these (see
+  // commitCubesDrag) to bring it back in sync before picking needs it again.
+  const dirtyBoundaryAxes = new Set();
+
+  // Appends one face instance to the end of its axis mesh (and its edge-outline
+  // counterpart, kept at the same slot index).
+  function addBoundaryFace(x, y, z, axis, sign, center) {
+    const mesh = ensureInstanceCapacity(cubeFaceMeshes, axis, boundaryFaceInfoByAxis[axis].length + 1);
+    const edgeMesh = ensureInstanceCapacity(cubeEdgeMeshes, axis, boundaryFaceInfoByAxis[axis].length + 1);
+    const i = boundaryFaceInfoByAxis[axis].length;
+    mesh.count = i + 1;
+    edgeMesh.count = i + 1;
+    const signIdx = sign === 1 ? 0 : 1;
+    faceTempPosition.set(center[0], center[1], center[2]);
+    faceTempMatrix.compose(faceTempPosition, faceQuaternions[axis][signIdx], faceTempScale);
+    mesh.setMatrixAt(i, faceTempMatrix);
+    edgeMesh.setMatrixAt(i, faceTempMatrix);
+    mesh.instanceMatrix.needsUpdate = true;
+    edgeMesh.instanceMatrix.needsUpdate = true;
+    boundaryFaceInfoByAxis[axis].push({ x, y, z, axis, sign, center });
+    faceSlotByAxis[axis].set(faceKey(x, y, z, sign), i);
+    dirtyBoundaryAxes.add(axis);
+  }
+
+  // Removes one face instance, swapping the last instance into its slot (both
+  // the matrix buffer and the parallel info/slot bookkeeping) so the mesh
+  // stays a dense [0, count) range. The edge-outline mesh mirrors the same
+  // swap so its slots stay aligned with the face mesh's.
+  function removeBoundaryFace(x, y, z, axis, sign) {
+    const key = faceKey(x, y, z, sign);
+    const slots = faceSlotByAxis[axis];
+    const i = slots.get(key);
+    if (i === undefined) return; // not currently a boundary face: nothing to do
+    const infos = boundaryFaceInfoByAxis[axis];
+    const mesh = cubeFaceMeshes[axis];
+    const edgeMesh = cubeEdgeMeshes[axis];
+    const lastIdx = infos.length - 1;
+    if (i !== lastIdx) {
+      mesh.getMatrixAt(lastIdx, faceTempMatrix);
+      mesh.setMatrixAt(i, faceTempMatrix);
+      edgeMesh.setMatrixAt(i, faceTempMatrix);
+      const moved = infos[lastIdx];
+      infos[i] = moved;
+      slots.set(faceKey(moved.x, moved.y, moved.z, moved.sign), i);
+    }
+    infos.pop();
+    slots.delete(key);
+    mesh.count = infos.length;
+    edgeMesh.count = infos.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    edgeMesh.instanceMatrix.needsUpdate = true;
+    dirtyBoundaryAxes.add(axis);
+  }
+
+  // Bring picking's bounding spheres back in sync after a batch of
+  // add/removeBoundaryFace calls (see the note above). Cheap to call when
+  // nothing changed (visits only the axes actually touched).
+  function finalizeBoundaryFaces() {
+    for (const axis of dirtyBoundaryAxes) cubeFaceMeshes[axis].computeBoundingSphere();
+    dirtyBoundaryAxes.clear();
+  }
+
+  // Add or remove the up-to-6 boundary faces touched by toggling ONE cube at
+  // (x,y,z): its own faces (all appear on add, all disappear on remove), plus
+  // — for each direction where a neighbor cube already exists — that
+  // neighbor's face pointing back at this cube (which flips the other way:
+  // disappears when this cube appears and stops being a gap, reappears when
+  // this cube is removed and exposes it again). `hasCube(x,y,z)` must reflect
+  // the model AFTER the toggle (i.e. call this after updating `positions`).
+  function toggleCubeFaces(x, y, z, adding, hasCube) {
+    for (const axis of [0, 1, 2]) {
+      for (const sign of [-1, 1]) {
+        const n = [x, y, z];
+        n[axis] += sign;
+        const neighborPresent = hasCube(n[0], n[1], n[2]);
+        if (adding) {
+          if (neighborPresent) {
+            // This cube fills a gap the neighbor's face was covering.
+            removeBoundaryFace(n[0], n[1], n[2], axis, -sign);
+          } else {
+            const center = [x + 0.5, y + 0.5, z + 0.5];
+            center[axis] += sign / 2;
+            addBoundaryFace(x, y, z, axis, sign, center);
+          }
+        } else {
+          removeBoundaryFace(x, y, z, axis, sign);
+          if (neighborPresent) {
+            const center = [n[0] + 0.5, n[1] + 0.5, n[2] + 0.5];
+            center[axis] += -sign / 2;
+            addBoundaryFace(n[0], n[1], n[2], axis, -sign, center);
+          }
+        }
+      }
     }
   }
 
+  // The diagonal-free frame geometry (not a wireframe-rendered PlaneGeometry,
+  // which would draw the diagonal shared by its two triangles along with the
+  // real edges).
   const hoverOutline = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.02, 1.02),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, side: THREE.DoubleSide })
+    makeSquareOutlineGeometry(1.02, 0.03),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
   );
   hoverOutline.visible = false;
   scene.add(hoverOutline);
@@ -481,6 +673,21 @@ export function createSceneRenderer(app) {
     }
   }
 
+  // Show/hide the skeleton meshes (vertices + edges) wholesale, e.g. for Cubes
+  // mode, which shows only cube faces. `ensureInstanceCapacity` carries
+  // `.visible` across a grown replacement mesh, so this holds even if the
+  // skeleton grows while hidden.
+  function setSkeletonVisible(visible) {
+    skeletonVertexHolder[0].visible = visible;
+    for (const mesh of skeletonEdgeMeshes) mesh.visible = visible;
+  }
+
+  // Show/hide the black square outlines on each boundary cube face — the
+  // Cubes-mode counterpart to setSkeletonVisible's Graph-mode edges.
+  function setCubeEdgesVisible(visible) {
+    for (const mesh of cubeEdgeMeshes) mesh.visible = visible;
+  }
+
   // --- Picking -------------------------------------------------------------
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
@@ -514,6 +721,41 @@ export function createSceneRenderer(app) {
 
   // Which axis' face mesh is this? -1 if the hit object isn't one of them.
   const faceMeshAxis = (object) => cubeFaceMeshes.indexOf(object);
+
+  // --- Cubes-mode drag geometry ---------------------------------------------
+  // How far the pointer must travel, in pixels, before the cubes-mode drag
+  // (see main.js) toggles the next cube. Expressed in cube-widths rather than
+  // a fixed pixel count so the gesture tracks the model, not the screen: drag
+  // across two cubes' worth of on-screen space and you get two cubes, whether
+  // the camera is close in or zoomed out. Floored so extreme zoom-out (a cube
+  // covering a pixel or two) can't turn a small twitch into a dozen cubes.
+  const DRAG_PER_CUBE = 0.75;
+  const MIN_DRAG_PIXELS = 8;
+
+  function dragStepPixels() {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const fov = THREE.MathUtils.degToRad(camera.fov);
+    const distance = camera.position.distanceTo(controls.target);
+    const visibleWorldHeight = 2 * distance * Math.tan(fov / 2);
+    const pixelsPerCube = rect.height / visibleWorldHeight; // cubes are unit size
+    return Math.max(MIN_DRAG_PIXELS, pixelsPerCube * DRAG_PER_CUBE);
+  }
+
+  // A world-space point's outward face-normal direction, projected to a 2-D
+  // screen-space vector — lets a cubes-mode drag tell "out of the face" from
+  // "into it" by comparing against the pointer's on-screen movement. `point`
+  // need not be a lattice point; the caller passes the actual face center.
+  const _screenDirBase = new THREE.Vector3();
+  const _screenDirTip = new THREE.Vector3();
+  function screenDirection(point, dir) {
+    _screenDirBase.set(point[0], point[1], point[2]).project(camera);
+    _screenDirTip.set(point[0] + dir[0], point[1] + dir[1], point[2] + dir[2]).project(camera);
+    const dx = _screenDirTip.x - _screenDirBase.x;
+    // Screen y grows downward (NDC y grows upward), hence the negation.
+    const dy = -(_screenDirTip.y - _screenDirBase.y);
+    const len = Math.hypot(dx, dy);
+    return len < 1e-9 ? { x: 0, y: -1 } : { x: dx / len, y: dy / len };
+  }
 
   // --- Hover outline -------------------------------------------------------
   // Snap the hover outline onto one instanced quad, nudged very slightly along
@@ -628,6 +870,10 @@ export function createSceneRenderer(app) {
     // model -> pixels
     renderBoundaryCubeFaces,
     renderBrinkSkeleton,
+    setSkeletonVisible,
+    setCubeEdgesVisible,
+    toggleCubeFaces,
+    finalizeBoundaryFaces,
     // face visibility (a rendering choice, owned here)
     faceVisibility,
     applyFaceVisibility,
@@ -647,6 +893,9 @@ export function createSceneRenderer(app) {
     faceMeshAxis,
     boundsBox,
     boundaryFaceInfo: (axis) => boundaryFaceInfoByAxis[axis],
+    // cubes-mode drag geometry
+    dragStepPixels,
+    screenDirection,
     // camera / viewport / loop
     getCameraState,
     setCameraState,

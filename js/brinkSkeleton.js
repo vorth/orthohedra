@@ -72,8 +72,9 @@ function canonicalCycleKey(keys) {
  * entry per cube face that does not directly adjoin another cube (i.e.
  * every face except those sandwiched between two present cubes).
  * @param {Array<{x:number,y:number,z:number}>} cubes - integer least corners
- * @returns {Array<{ cubeIndex: number, axis: number, sign: number, center: [number,number,number] }>}
- *   `center` is the face's geometric center in world coordinates.
+ * @returns {Array<{ x:number, y:number, z:number, axis: number, sign: number, center: [number,number,number] }>}
+ *   `x,y,z` is the owning cube's least corner; `center` is the face's
+ *   geometric center in world coordinates.
  */
 export function computeBoundaryCubeFaces(cubes) {
   const occupiedSet = new Set(cubes.map(({ x, y, z }) => `${x},${y},${z}`));
@@ -82,8 +83,7 @@ export function computeBoundaryCubeFaces(cubes) {
   }
 
   const boundaryFaces = [];
-  for (let cubeIndex = 0; cubeIndex < cubes.length; cubeIndex++) {
-    const { x, y, z } = cubes[cubeIndex];
+  for (const { x, y, z } of cubes) {
     for (const axis of AXES) {
       for (const sign of [-1, 1]) {
         const n = [x, y, z];
@@ -93,7 +93,7 @@ export function computeBoundaryCubeFaces(cubes) {
         // half a unit further along `axis` in the `sign` direction.
         const center = [x + 0.5, y + 0.5, z + 0.5];
         center[axis] += sign / 2;
-        boundaryFaces.push({ cubeIndex, axis, sign, center });
+        boundaryFaces.push({ x, y, z, axis, sign, center });
       }
     }
   }

@@ -5,6 +5,7 @@
 - better topology metrics
   - Euler per-component
   - face counts by size
+  - count of singular points
 - count of unit squares
 - modes
   - cubes

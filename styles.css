@@ -48,7 +48,7 @@ body {
 
 .modes {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
 }
 
@@ -73,17 +73,12 @@ body {
   cursor: default;
 }
 
-.mode-btn.active[data-mode="build"] {
+.mode-btn.active[data-mode="cubes"] {
   border-color: var(--accent);
   background: rgba(87, 214, 165, 0.2);
 }
 
-.mode-btn.active[data-mode="destroy"] {
-  border-color: var(--accent-2);
-  background: rgba(255, 122, 107, 0.2);
-}
-
-#moveBtn.active {
+.mode-btn.active[data-mode="graph"] {
   border-color: #b98bff;
   background: rgba(185, 139, 255, 0.2);
 }

@@ -21,9 +21,8 @@ const app = document.querySelector('design-app');
 const errorEl = document.getElementById('error');
 const statusEl = document.getElementById('status');
 const skeletonStatsEl = document.getElementById('skeletonStats');
-const buildBtn = document.getElementById('buildBtn');
-const destroyBtn = document.getElementById('destroyBtn');
-const moveBtn = document.getElementById('moveBtn');
+const cubesBtn = document.getElementById('cubesBtn');
+const graphBtn = document.getElementById('graphBtn');
 const busyOverlay = document.getElementById('busyOverlay');
 const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
@@ -35,14 +34,36 @@ async function main() {
   const view = createSceneRenderer(viewport);
   const faceVisibility = view.faceVisibility;
 
-  // --- Move mode: drag a connected boundary face along its orthogonal axis --
-  // `moveMode` is a single toggle. While active, ANY visible boundary face can
-  // be grabbed; the axis of the face hit (its normal) becomes the drag axis, so
-  // the face slides freely along that axis. Invisible (hidden) faces aren't
-  // grabbable. Rendering is independent and driven entirely by per-axis face
-  // visibility (see applyFaceVisibility).
-  let moveMode = false;
+  // --- Modes ---------------------------------------------------------------
+  // Two modes, matching the Gp/Gb split (see project memory): "cubes" is
+  // graph-breaking (Gb) — drag a boundary face to sweep cubes in or out, and
+  // the graph is freely re-derived from the result. "graph" is
+  // graph-preserving (Gp) — drag a boundary face along its normal axis to
+  // slide it, and the drag surgically rewrites vertex coordinates on the
+  // affected face cycles without ever touching edge/face identity. Both drags
+  // grab only VISIBLE boundary faces — picking (getIntersection) already
+  // filters to them, so hidden faces let the gesture fall through to the
+  // trackball instead.
+  //
+  // Starts null (not 'cubes') so the first setMode() call in applyInitialState
+  // always applies its visual side effects (button state, skeleton
+  // visibility) instead of short-circuiting on an already-equal mode.
+  let mode = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
+
+  // Drag state for both modes, declared up front: setMode() (called from
+  // applyInitialState() during startup, before either drag's own section
+  // below runs) calls cancelGraphDrag()/cancelCubesDrag(), which read these —
+  // declared this early so that first call doesn't hit the temporal dead zone.
+  //
+  // Graph-mode drag: { axis, face, dragged, index, limits, baseSkeleton,
+  //   skeleton, steps, linePoint, dragValue }
+  let drag = null;
+  // A grabbed-but-trapped face (grabbable, but with no legal destination): the
+  // gesture is consumed and its impeders shown, but there is no live drag.
+  let trapped = false;
+  // Cubes-mode drag: { cell, dir, facePoint, baseSkeleton, startX, startY, moved }
+  let cubesDrag = null;
 
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
   // at the grabbed quad's coordinate) whose edges the grabbed quad is nearest.
@@ -138,7 +159,7 @@ async function main() {
       return;
     }
     adoptSkeleton(skeleton);
-    updateStatus(mode);
+    updateStatus();
   }
 
   // Record a graph-level change (`from` -> `to`) as one undoable step.
@@ -188,7 +209,7 @@ async function main() {
       view.setCameraState(state.camera);
     }
 
-    updateStatus(mode);
+    setMode('graph'); // a deliberate load/open always opens in Graph mode
   }
 
   // A saved file holds an abstract GRAPH (edges + faces) and, optionally, a
@@ -304,8 +325,8 @@ async function main() {
     return occupied.has(key(x, y, z));
   }
 
-  function updateStatus(mode) {
-    const label = moveMode ? 'Move' : mode === 'build' ? 'Build' : 'Destroy';
+  function updateStatus() {
+    const label = mode === 'cubes' ? 'Cubes' : 'Graph';
     statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
   }
 
@@ -377,50 +398,13 @@ async function main() {
     const after = computeBrinkSkeleton(positions);
     recordSkeletonEdit(before, after, 'Reset');
     adoptSkeleton(after);
-    updateStatus(mode);
-  }
-
-  function addVoxel(x, y, z) {
-    if (!inBounds(x, y, z) || hasVoxel(x, y, z)) return false;
-
-    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
-    const idx = positions.length;
-    const pos = { x, y, z };
-    positions.push(pos);
-    occupied.set(key(x, y, z), idx);
-
-    const after = computeBrinkSkeleton(positions);
-    recordSkeletonEdit(before, after, 'Add cube');
-    adoptSkeleton(after);
-    return true;
-  }
-
-  function removeVoxel(x, y, z) {
-    const removeKey = key(x, y, z);
-    const removeIdx = occupied.get(removeKey);
-    if (removeIdx === undefined) return false;
-
-    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
-    const lastIdx = positions.length - 1;
-    const lastPos = positions[lastIdx];
-
-    if (removeIdx !== lastIdx) {
-      positions[removeIdx] = lastPos;
-      occupied.set(key(lastPos.x, lastPos.y, lastPos.z), removeIdx);
-    }
-
-    positions.pop();
-    occupied.delete(removeKey);
-    const after = computeBrinkSkeleton(positions);
-    recordSkeletonEdit(before, after, 'Remove cube');
-    adoptSkeleton(after);
-    return true;
+    updateStatus();
   }
 
   // Presence toggles that DON'T recompute the skeleton — for batched edits
-  // (e.g. a face-move sweeping many cells) where the caller recomputes once at
-  // the end via updateBrinkSkeleton(). Same swap-pop bookkeeping as
-  // add/removeVoxel, just without the per-cell recompute.
+  // (a cubes-mode drag sweeping many cells, a face-move, a reset/load) where
+  // the caller recomputes once at the end via updateBrinkSkeleton() or a
+  // single computeBrinkSkeleton() call of its own.
   function addVoxelRaw(x, y, z) {
     if (!inBounds(x, y, z) || hasVoxel(x, y, z)) return false;
     occupied.set(key(x, y, z), positions.length);
@@ -443,7 +427,6 @@ async function main() {
     return true;
   }
 
-  let mode = 'build';
   let downX = 0;
   let downY = 0;
 
@@ -486,6 +469,10 @@ async function main() {
   // <design-app>'s undo stack simply starts empty (Undo disabled) until the
   // user makes a first real change, which is the correct "nothing to undo yet"
   // state.
+  //
+  // Mode on entry: an actual restored state (autosave or ?design=) opens in
+  // Graph mode, matching a deliberate load/open; the fallback single cube
+  // (nothing to restore) opens in Cubes mode, matching a fresh "New".
   function applyInitialState(state) {
     if (state?.camera) view.setCameraState(state.camera);
     if (state?.faceVisibility) faceVisibility.splice(0, 3, ...state.faceVisibility);
@@ -508,89 +495,43 @@ async function main() {
       addVoxelRaw(0, 0, 0);
     }
     updateBrinkSkeleton();
-    updateStatus(mode);
+    setMode(restored?.length ? 'graph' : 'cubes');
   }
 
   function setMode(nextMode) {
+    if (mode === nextMode) return;
+    cancelGraphDrag(); // abandon any in-flight graph-mode drag
+    cancelCubesDrag(); // abandon any in-flight cubes-mode drag
     mode = nextMode;
-    setMoveMode(false); // Build/Destroy and Move are mutually exclusive
-    buildBtn.classList.toggle('active', mode === 'build');
-    destroyBtn.classList.toggle('active', mode === 'destroy');
-    updateStatus(mode);
+    cubesBtn.classList.toggle('active', mode === 'cubes');
+    graphBtn.classList.toggle('active', mode === 'graph');
+    // Skeleton edges/vertices are graph-mode-only; cubes mode shows only cube
+    // faces, outlined in black instead (see CLAUDE.md's Two modes note —
+    // Gp/Gb are visually distinct).
+    view.setSkeletonVisible(mode === 'graph');
+    view.setCubeEdgesVisible(mode === 'cubes');
+    view.hideHoverOutline();
+    updateStatus();
   }
 
-  function setMoveMode(on) {
-    if (moveMode === on) return;
-    cancelDrag();
-    moveMode = on;
-    moveBtn.classList.toggle('active', on);
-    // Rendering is decoupled from the move gesture: face visibility stays in
-    // effect whether or not move mode is active.
-    if (!on) {
-      // nothing to tear down: the drag's visuals are cleared by cancelDrag
-    } else {
-      // Leaving Build/Destroy: drop their active styling and status.
-      buildBtn.classList.remove('active');
-      destroyBtn.classList.remove('active');
-      view.hideHoverOutline();
-      updateStatus(mode);
-    }
-  }
-
-  function toggleMoveMode() {
-    setMoveMode(!moveMode);
-  }
-
-  function handleEdit(clientX, clientY) {
+  // A plain click/tap (not a drag) that misses every small boundary-cube face:
+  // it falls through to the giant boundary cube, and hitting one of ITS faces
+  // cycles that axis's face visibility (solid -> translucent -> hidden). This
+  // is the only thing a plain click still does — both modes edit exclusively
+  // by dragging (see startCubesDrag / startGraphDrag) — so a click that also
+  // misses the giant box does nothing. The ray crosses two walls (the box
+  // faces are DoubleSide), returned sorted near->far; take the LAST so we
+  // cycle the FAR face the user actually sees, not the near wall in front of
+  // the camera.
+  function handleClick(clientX, clientY) {
     if (realizer.isBusy()) return; // edits are suspended while a realization runs
-    const hits = view.getIntersection(clientX, clientY);
-
-    // A click that misses every small boundary-cube face falls through to the
-    // giant boundary cube: hitting one of its faces cycles that axis's face
-    // visibility (solid -> translucent -> hidden). Checked before the move-mode
-    // early return so this rendering control works in any editing mode. The
-    // ray crosses two walls (the box faces are DoubleSide), returned sorted
-    // near->far; take the LAST so we cycle the FAR face the user actually sees,
-    // not the near wall in front of the camera.
-    if (!hits.length) {
-      const boxHits = view.getIntersection(clientX, clientY, [view.boundsBox]);
-      const farHit = boxHits[boxHits.length - 1];
-      if (farHit && farHit.face) {
-        view.cycleFaceVisibility(farHit.face.materialIndex >> 1);
-      }
-      return;
+    if (view.getIntersection(clientX, clientY).length) return; // hit a cube face: not a background click
+    const boxHits = view.getIntersection(clientX, clientY, [view.boundsBox]);
+    const farHit = boxHits[boxHits.length - 1];
+    if (farHit && farHit.face) {
+      view.cycleFaceVisibility(farHit.face.materialIndex >> 1);
     }
-
-    if (moveMode) return; // move mode has its own drag interaction
-
-    const hit = hits[0];
-    const id = hit.instanceId;
-    if (id === undefined || id === null) return;
-
-    const axis = view.faceMeshAxis(hit.object);
-    const info = view.boundaryFaceInfo(axis)?.[id];
-    if (!info) return;
-    const { x, y, z } = positions[info.cubeIndex];
-
-    if (mode === 'destroy') {
-      if (removeVoxel(x, y, z)) updateStatus(mode);
-      return;
-    }
-
-    const nx = x + (info.axis === 0 ? info.sign : 0);
-    const ny = y + (info.axis === 1 ? info.sign : 0);
-    const nz = z + (info.axis === 2 ? info.sign : 0);
-
-    if (addVoxel(nx, ny, nz)) updateStatus(mode);
   }
-
-  // --- Move-mode drag state and geometry -----------------------------------
-  // { axis, face, dragged, index, limits, baseSkeleton, skeleton, steps,
-  //   linePoint, dragValue }
-  let drag = null;
-  // A grabbed-but-trapped face (grabbable, but with no legal destination): the
-  // gesture is consumed and its impeders shown, but there is no live drag.
-  let trapped = false;
 
   // Closest edit-axis value on the line through `linePoint` (parallel to
   // `axis`) to the pointer ray — the drag value. Derived by minimizing the
@@ -689,7 +630,7 @@ async function main() {
     return true;
   }
 
-  function startDrag(axis, hitId, hitPoint) {
+  function startGraphDrag(axis, hitId, hitPoint) {
     const face = connectedFace(axis, hitId, hitPoint);
     if (!face) return false; // not a grabbable face: let the gesture rotate the camera
 
@@ -773,7 +714,7 @@ async function main() {
     view.renderBoundaryCubeFaces(positions);
   }
 
-  function updateDrag(clientX, clientY) {
+  function updateGraphDrag(clientX, clientY) {
     drag.dragValue = dragValueFromRay(clientX, clientY, drag.axis, drag.linePoint);
 
     // Apply as many steps as the pointer has earned. The loop matters: a fast
@@ -798,7 +739,7 @@ async function main() {
     view.moveGrabbedFace(drag.axis, drag.face.segments, drag.dragValue);
   }
 
-  function commitDrag() {
+  function commitGraphDrag() {
     const { skeleton, steps, baseSkeleton } = drag;
     const moved = steps.length > 0;
     endDrag();
@@ -823,7 +764,7 @@ async function main() {
     // `updateBrinkSkeleton`) takes the graph we already hold.
     recordSkeletonEdit(baseSkeleton, skeleton, 'Move face');
     adoptSkeleton(skeleton);
-    updateStatus(mode);
+    updateStatus();
   }
 
   function endDrag() {
@@ -834,7 +775,7 @@ async function main() {
     view.hideImpeders();
   }
 
-  function cancelDrag() {
+  function cancelGraphDrag() {
     // A live drag has already rewritten BOTH the rendered skeleton and the
     // voxel set in place, so abandoning it must put the pre-gesture drawing
     // back and refill the cubes from it — the steps are discarded wholesale
@@ -853,9 +794,143 @@ async function main() {
     }
   }
 
-  buildBtn.addEventListener('click', () => setMode('build'));
-  destroyBtn.addEventListener('click', () => setMode('destroy'));
-  moveBtn.addEventListener('click', () => toggleMoveMode());
+  // --- Cubes-mode drag ------------------------------------------------------
+  // Adapted from the design-app sample (sample/cubes.js + scene.js): grab any
+  // boundary face and drag along its normal. Dragging OUTWARD from the face
+  // ("pull") sweeps empty cells into cubes; dragging INWARD ("push") carves
+  // them away. Crossing another face flips the rule, so a drag that runs into
+  // existing cubes starts carving through them, and one that breaks out the
+  // far side starts laying cubes down again.
+  //
+  // Unlike the graph-mode drag, this recomputes the skeleton and records ONE
+  // undo edit only at release (see commitCubesDrag) — mid-drag, only the cube
+  // faces are re-rendered (view.renderBoundaryCubeFaces), never the skeleton,
+  // per CLAUDE.md's bulk-edit rule and this mode's "no graph shown" rendering.
+
+  // Refuse to empty the model completely; there must always be something left
+  // to grab hold of. Mirrors CubeModel#planStep in the sample.
+  function canRemoveLastCube() {
+    return positions.length > 1;
+  }
+
+  // Toggle exactly one cell per the parity rule: occupied -> remove, empty ->
+  // add. Updates the voxel set AND the rendered boundary faces incrementally
+  // (view.toggleCubeFaces touches only the ~6 faces this one cube's toggle
+  // can affect, not the whole model — see sceneRenderer.js). Returns true if
+  // a change was made.
+  function toggleCubesDragCell(cell) {
+    const [x, y, z] = cell;
+    if (hasVoxel(x, y, z)) {
+      if (!canRemoveLastCube()) return false;
+      if (!removeVoxelRaw(x, y, z)) return false;
+      view.toggleCubeFaces(x, y, z, false, hasVoxel);
+      return true;
+    }
+    if (!addVoxelRaw(x, y, z)) return false;
+    view.toggleCubeFaces(x, y, z, true, hasVoxel);
+    return true;
+  }
+
+  function startCubesDrag(clientX, clientY) {
+    const hit = view.getIntersection(clientX, clientY)[0];
+    if (!hit || hit.instanceId === undefined || hit.instanceId === null) return false;
+    const axis = view.faceMeshAxis(hit.object);
+    const info = view.boundaryFaceInfo(axis)?.[hit.instanceId];
+    if (!info) return false;
+    const dir = [0, 0, 0];
+    dir[info.axis] = info.sign;
+
+    cubesDrag = {
+      cell: [info.x, info.y, info.z],
+      dir,
+      facePoint: info.center, // for screen-space projection, NOT the parity toggle
+      baseSkeleton: currentSkeleton ?? computeBrinkSkeleton(positions),
+      startX: clientX,
+      startY: clientY,
+      moved: false,
+    };
+    view.setControlsEnabled(false);
+    return true;
+  }
+
+  function updateCubesDrag(clientX, clientY) {
+    const dx = clientX - cubesDrag.startX;
+    const dy = clientY - cubesDrag.startY;
+    const stepPixels = view.dragStepPixels();
+    if (Math.hypot(dx, dy) < stepPixels) return;
+
+    // Project the drag onto the face normal in screen space: dragging along
+    // the outward normal pulls (adds), against it pushes (removes). Anchored
+    // at the working face's actual world position (facePoint), not the
+    // lattice cell — they differ by up to half a cube, which perspective
+    // projection can turn into a meaningfully wrong screen direction.
+    const outward = view.screenDirection(cubesDrag.facePoint, cubesDrag.dir);
+    const along = dx * outward.x + dy * outward.y;
+    const kind = along >= 0 ? 'pull' : 'push';
+    // Pulling acts on the cell just beyond the grabbed face; pushing acts on
+    // the grabbed cell itself.
+    const [cx, cy, cz] = cubesDrag.cell;
+    const [dxAxis, dyAxis, dzAxis] = cubesDrag.dir;
+    const target = kind === 'pull' ? [cx + dxAxis, cy + dyAxis, cz + dzAxis] : [cx, cy, cz];
+
+    // Re-anchor at the current pointer position either way, so the next step
+    // is measured from here.
+    cubesDrag.startX = clientX;
+    cubesDrag.startY = clientY;
+
+    if (!toggleCubesDragCell(target)) return; // refused (e.g. last cube): face stays put
+    cubesDrag.moved = true;
+
+    // Advance the working face (and its projection point) one cell along the
+    // sweep direction, regardless of whether this step added or removed — the
+    // sweep keeps going the way the user is dragging.
+    const step = kind === 'pull' ? 1 : -1;
+    cubesDrag.cell = [cx + dxAxis * step, cy + dyAxis * step, cz + dzAxis * step];
+    const [fx, fy, fz] = cubesDrag.facePoint;
+    cubesDrag.facePoint = [fx + dxAxis * step, fy + dyAxis * step, fz + dzAxis * step];
+
+    // No skeleton recompute mid-drag (it stays hidden throughout — Cubes mode
+    // never shows it), and toggleCubesDragCell above already updated the
+    // rendered faces incrementally — no full-model re-render per step.
+  }
+
+  function commitCubesDrag() {
+    const { baseSkeleton, moved } = cubesDrag;
+    cubesDrag = null;
+    view.setControlsEnabled(true);
+    view.finalizeBoundaryFaces(); // bring picking's bounding spheres back in sync
+    if (!moved) return; // nothing changed: no recompute, no history entry
+
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(baseSkeleton, after, 'Edit cubes');
+    // adoptSkeleton would also render the (hidden) skeleton meshes and the
+    // stats readout; both are still worth keeping in sync for when the user
+    // switches to Graph mode, so use it rather than a lighter render.
+    adoptSkeleton(after);
+    updateStatus();
+  }
+
+  // Abandon an in-flight cubes-mode drag (e.g. on a mode switch), restoring
+  // the pre-gesture cubes without recomputing or recording anything.
+  function cancelCubesDrag() {
+    if (!cubesDrag) return;
+    const { baseSkeleton, moved } = cubesDrag;
+    cubesDrag = null;
+    view.setControlsEnabled(true);
+    if (!moved) return;
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(baseSkeleton));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+      view.renderBoundaryCubeFaces(positions);
+    } catch (error) {
+      console.error('Cubes drag: could not restore cubes after cancel:', error);
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
+    }
+  }
+
+  cubesBtn.addEventListener('click', () => setMode('cubes'));
+  graphBtn.addEventListener('click', () => setMode('graph'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
   // <design-app> drives undo/redo (button + keyboard), Save/Save As, and the
@@ -876,6 +951,7 @@ async function main() {
 
   app.addEventListener('app-new', () => {
     reset();
+    setMode('cubes'); // a fresh "New" always opens in Cubes mode
     view.centerView(positions);
   });
 
@@ -900,30 +976,38 @@ async function main() {
   view.domElement.addEventListener('pointerdown', (event) => {
     downX = event.clientX;
     downY = event.clientY;
+    if (realizer.isBusy()) return;
 
-    // In move mode, grabbing ANY visible boundary face starts a drag along that
-    // face's normal axis, and suspends the trackball so the camera doesn't
-    // rotate mid-drag. The axis is whichever face mesh was hit.
-    if (moveMode && !realizer.isBusy()) {
+    if (mode === 'graph') {
+      // Grabbing ANY visible boundary face starts a drag along that face's
+      // normal axis, and suspends the trackball so the camera doesn't rotate
+      // mid-drag. The axis is whichever face mesh was hit.
       const hit = view.getIntersection(event.clientX, event.clientY)[0];
       if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
         const axis = view.faceMeshAxis(hit.object);
-        if (axis !== -1 && startDrag(axis, hit.instanceId, hit.point)) {
+        if (axis !== -1 && startGraphDrag(axis, hit.instanceId, hit.point)) {
           view.hideHoverOutline();
           event.preventDefault();
         }
       }
+    } else if (startCubesDrag(event.clientX, event.clientY)) {
+      view.hideHoverOutline();
+      event.preventDefault();
     }
   });
 
   view.domElement.addEventListener('pointermove', (event) => {
     if (drag) {
-      updateDrag(event.clientX, event.clientY);
+      updateGraphDrag(event.clientX, event.clientY);
+      return;
+    }
+    if (cubesDrag) {
+      updateCubesDrag(event.clientX, event.clientY);
       return;
     }
 
-    // Hover highlight over any grabbable (visible) boundary face — the same set
-    // in move mode and in build/destroy, since move now grabs any visible face.
+    // Hover highlight over any grabbable (visible) boundary face — the same
+    // set in both modes, since either drag can grab any visible face.
     const hits = view.getIntersection(event.clientX, event.clientY);
     if (!hits.length || hits[0].instanceId === undefined || hits[0].instanceId === null) {
       view.hideHoverOutline();
@@ -935,21 +1019,23 @@ async function main() {
 
   view.domElement.addEventListener('pointerup', (event) => {
     if (drag) {
-      commitDrag();
+      commitGraphDrag();
       return;
     }
     if (trapped) {
       endDrag(); // clear the trapped-face preview; nothing to commit
       return;
     }
+    if (cubesDrag) {
+      commitCubesDrag();
+      return;
+    }
     const dist = Math.hypot(event.clientX - downX, event.clientY - downY);
     if (dist > 3) return;
-    handleEdit(event.clientX, event.clientY);
+    handleClick(event.clientX, event.clientY);
   });
 
   window.addEventListener('resize', () => view.handleResize());
-
-  updateStatus(mode);
 
   view.start();
 }
