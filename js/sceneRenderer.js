@@ -5,9 +5,7 @@
 // The dependency runs ONE WAY. This module is a SINK: it takes plain data
 // (cube positions, a skeleton, in-plane segments) and puts pixels on screen. It
 // never reads the voxel set, the history, or the drag state, and it calls
-// nothing in main.js — the single outward call that used to exist
-// (cycleFaceVisibility triggering an autosave) is now an `onFaceVisibilityChange`
-// callback the caller supplies.
+// nothing in main.js.
 //
 // It is a factory rather than loose exports because it owns a great deal of
 // mutable GPU state — meshes, materials, instance capacities, the per-axis
@@ -34,15 +32,13 @@ import {
   FACE_HIDDEN,
 } from "./constants.js";
 
-// `onFaceVisibilityChange` is called after a visibility cycle so the caller can
-// persist the new view state.
 // Initial per-mesh instance capacity; ensureInstanceCapacity() grows it (to the
 // next power of two) whenever a render needs more. Deliberately small: the
 // number of boundary faces and skeleton elements is bounded by the cubes
 // actually placed (a surface-area quantity), never by the world volume.
 const INITIAL_INSTANCES = 4096;
 
-export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
+export function createSceneRenderer(app) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1a1a);
 
@@ -437,7 +433,6 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
   function cycleFaceVisibility(axis) {
     faceVisibility[axis] = (faceVisibility[axis] + 2) % 3; // 2->1->0->2
     applyFaceVisibility();
-    onFaceVisibilityChange?.();
   }
 
   const skeletonTempMatrix = new THREE.Matrix4();
@@ -569,6 +564,44 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
     controls.update();
   }
 
+  // Pan/zoom so the model's bounding sphere fills about half the viewport
+  // (its diameter spans half the shorter screen dimension), keeping the
+  // current viewing direction and up — only WHERE the camera looks from
+  // changes, not which way it's oriented. For a "Center View" menu item.
+  //
+  // `positions` are cube least-corners (unit cubes), so the model's world
+  // bounds run from the min corner to the max corner + 1 on each axis.
+  function centerView(positions) {
+    if (!positions.length) return;
+    const box = new THREE.Box3();
+    const corner = new THREE.Vector3();
+    for (const { x, y, z } of positions) {
+      corner.set(x, y, z);
+      box.expandByPoint(corner);
+      corner.set(x + 1, y + 1, z + 1);
+      box.expandByPoint(corner);
+    }
+    const center = box.getCenter(new THREE.Vector3());
+    const radius = box.getSize(new THREE.Vector3()).length() / 2;
+
+    // Distance at which the bounding sphere's diameter fills half the
+    // vertical frustum: half-height at distance d is d*tan(fov/2), so a
+    // sphere of radius r fills half of that when d = r / (0.5*tan(fov/2)).
+    // The horizontal frustum is narrower than the vertical one whenever the
+    // viewport is portrait-oriented (aspect < 1), so account for aspect too.
+    const verticalHalfAngle = THREE.MathUtils.degToRad(camera.fov / 2);
+    const limitingHalfAngle = camera.aspect >= 1
+      ? verticalHalfAngle
+      : Math.atan(Math.tan(verticalHalfAngle) * camera.aspect);
+    const distance = radius / (0.5 * Math.tan(limitingHalfAngle));
+
+    // Keep the current viewing direction: move along the (target -> eye) ray,
+    // re-centered on the model, to the distance computed above.
+    const direction = camera.position.clone().sub(controls.target).normalize();
+    const position = center.clone().addScaledVector(direction, distance);
+    setCameraState({ position: position.toArray(), target: center.toArray(), up: camera.up.toArray() });
+  }
+
   function handleResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
@@ -581,8 +614,6 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
   const setControlsEnabled = (on) => {
     controls.enabled = on;
   };
-
-  const onCameraChange = (fn) => controls.addEventListener('change', fn);
 
   function start() {
     renderer.setAnimationLoop(() => {
@@ -619,8 +650,8 @@ export function createSceneRenderer(app, { onFaceVisibilityChange } = {}) {
     // camera / viewport / loop
     getCameraState,
     setCameraState,
+    centerView,
     setControlsEnabled,
-    onCameraChange,
     handleResize,
     start,
   };

@@ -26,8 +26,6 @@ export const FACE_SOLID = 2;
 export const FACE_TRANSLUCENT = 1;
 export const FACE_HIDDEN = 0;
 
-export const STORAGE_KEY = 'cubes-editor:state';
-
 // Is this lattice point inside the editable region? Shared by the voxel
 // primitives, the load path's coordinate validation, and out-of-bounds culling.
 export function inBounds(x, y, z) {

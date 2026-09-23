@@ -25,36 +25,31 @@ body {
   font-family: "Avenir Next", "Segoe UI", sans-serif;
 }
 
-#app {
-  position: fixed;
-  inset: 0;
+#viewport {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
 }
 
-#overlay {
-  position: fixed;
-  top: 12px;
-  left: 12px;
+#modeOverlay {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
   z-index: 10;
+  width: 300px;
   padding: 10px;
   border-radius: 12px;
   background: var(--panel);
   border: 1px solid var(--outline);
   backdrop-filter: blur(8px);
   user-select: none;
-  min-width: 220px;
-}
-
-#title {
-  margin: 0 0 8px;
-  font-size: 0.95rem;
-  letter-spacing: 0.02em;
-  color: var(--text);
 }
 
 .modes {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   gap: 8px;
-  margin-bottom: 8px;
 }
 
 .mode-btn {
@@ -63,7 +58,7 @@ body {
   border-radius: 8px;
   background: #1b2444;
   color: var(--text);
-  padding: 6px 10px;
+  padding: 10px;
   cursor: pointer;
   font-size: 0.85rem;
   transition: transform 0.1s ease, background-color 0.15s ease, border-color 0.15s ease;
@@ -91,26 +86,6 @@ body {
 #moveBtn.active {
   border-color: #b98bff;
   background: rgba(185, 139, 255, 0.2);
-}
-
-.edit-actions {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.file-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--outline);
-}
-
-.file-actions .mode-btn {
-  font-size: 0.8rem;
-  padding: 5px 8px;
 }
 
 #status {

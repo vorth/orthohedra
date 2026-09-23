@@ -5,31 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Orthohedra</title>
   <link rel="stylesheet" href="styles.css">
+  <script type="module" src="https://vorth.github.io/design-app/module/index.js"></script>
 </head>
 <body>
-  <div id="app"></div>
+  <design-app
+    app-title="Orthohedra"
+    file-extension=".json"
+    file-description="Orthohedra design"
+    file-mime="application/json"
+    autosave-key="cubes-editor:state"
+  >
+    <div id="viewport">
+      <div id="modeOverlay">
+        <div class="modes">
+          <button class="mode-btn active" data-mode="build" id="buildBtn">Build</button>
+          <button class="mode-btn" data-mode="destroy" id="destroyBtn">Destroy</button>
+          <button class="mode-btn" id="moveBtn">Move</button>
+        </div>
+      </div>
+    </div>
 
-  <div id="overlay">
-    <h1 id="title">Orthohedra</h1>
-    <div class="modes">
-      <button class="mode-btn active" data-mode="build" id="buildBtn">Build</button>
-      <button class="mode-btn" data-mode="destroy" id="destroyBtn">Destroy</button>
-      <button class="mode-btn" id="moveBtn">Move</button>
+    <div slot="info">
+      <p id="status">Mode: Build<br>Cubes: 1</p>
+      <p id="skeletonStats"></p>
     </div>
-    <div class="edit-actions">
-      <button class="mode-btn" id="undoBtn" disabled>Undo</button>
-      <button class="mode-btn" id="redoBtn" disabled>Redo</button>
-    </div>
-    <div class="file-actions">
-      <button class="mode-btn" id="saveBtn">Save</button>
-      <button class="mode-btn" id="saveAsBtn">Save As…</button>
-      <button class="mode-btn" id="loadBtn">Load Cubes…</button>
-      <button class="mode-btn" id="loadAbstractBtn">Load Abstract…</button>
-      <button class="mode-btn" id="resetBtn">Reset</button>
-    </div>
-    <p id="status">Mode: Build<br>Cubes: 1</p>
-    <p id="skeletonStats"></p>
-  </div>
+  </design-app>
 
   <div id="error"></div>
 

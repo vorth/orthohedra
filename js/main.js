@@ -14,37 +14,25 @@ import {
   planeOfFace,
 } from "./faceGeometry.js";
 import { createRealizer } from "./realization.js";
-import {
-  saveToLocalStorage as writeLocalStorage,
-  loadFromLocalStorage,
-  createFileStore,
-  loadFromDesignParam,
-} from "./persistence.js";
+import { serialize, parseSavedState, pickAndParseFile, loadFromDesignParam } from "./persistence.js";
 import { createSceneRenderer } from "./sceneRenderer.js";
 
-const app = document.getElementById('app');
+const app = document.querySelector('design-app');
 const errorEl = document.getElementById('error');
 const statusEl = document.getElementById('status');
 const skeletonStatsEl = document.getElementById('skeletonStats');
 const buildBtn = document.getElementById('buildBtn');
 const destroyBtn = document.getElementById('destroyBtn');
-const resetBtn = document.getElementById('resetBtn');
 const moveBtn = document.getElementById('moveBtn');
-const undoBtn = document.getElementById('undoBtn');
-const redoBtn = document.getElementById('redoBtn');
-const saveBtn = document.getElementById('saveBtn');
-const saveAsBtn = document.getElementById('saveAsBtn');
-const loadBtn = document.getElementById('loadBtn');
-const loadAbstractBtn = document.getElementById('loadAbstractBtn');
 const busyOverlay = document.getElementById('busyOverlay');
 const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
+await customElements.whenDefined('design-app');
+
 async function main() {
   // All drawing lives in sceneRenderer.js; this is the only handle to it.
-  // The visibility-cycle callback is wired after saveToLocalStorage exists.
-  const view = createSceneRenderer(app, {
-    onFaceVisibilityChange: () => saveToLocalStorage(),
-  });
+  const viewport = document.getElementById('viewport');
+  const view = createSceneRenderer(viewport);
   const faceVisibility = view.faceVisibility;
 
   // --- Move mode: drag a connected boundary face along its orthogonal axis --
@@ -117,29 +105,57 @@ async function main() {
   const positions = [];
 
   // --- Undo/redo -----------------------------------------------------------
-  // Each entry snapshots the Graph Drawing, which IS the model state. Cubes are
-  // left out because they are derived — a restore refills them from the drawing
-  // (~49ms even for the 37k-cube Klein quartic, imperceptible for an undo).
-  // Face visibility and camera are left out because they are rendering choices,
-  // not model state: an undo should revert your edit without disturbing how you
-  // are looking at it.
+  // Undo/redo is <design-app>'s: every edit is pushed via app.edit({label,
+  // redo, undo}), which owns the stack, the Undo/Redo UI, and their keyboard
+  // shortcuts. Each edit's thunks close over the Graph Drawing (the skeleton)
+  // before and after the change, which IS the model state — cubes are left out
+  // because they are derived, and a redo/undo thunk refills them from the
+  // drawing (~49ms even for the 37k-cube Klein quartic, imperceptible for an
+  // undo). Face visibility and camera are never pushed as edits: they are
+  // rendering choices, not model state, so an undo reverts your edit without
+  // disturbing how you are looking at it.
   //
-  // Snapshots rather than per-operation inverses: the drawing is small (3.9 KB
-  // for the largest design in designs/, so even hundreds of entries cost a
-  // couple of MB), and an inverse that is subtly wrong corrupts state silently,
-  // which a snapshot cannot do. History is unbounded, and one stack carries
-  // both graph-preserving and graph-breaking edits.
+  // Whole-skeleton snapshots rather than per-operation inverses: the drawing is
+  // small (3.9 KB for the largest design in designs/), and an inverse that is
+  // subtly wrong corrupts state silently, which a snapshot cannot do.
   //
   // No deep copy is needed: every producer of a skeleton (computeBrinkSkeleton,
   // applySwapStep) returns a fresh object with a fresh vertices array,
   // and nothing mutates a skeleton in place.
-  const history = { entries: [], index: -1 }; // entries[index] is the current state
+
+  // Refill `positions` from a skeleton snapshot and adopt it as current — the
+  // shared body of every edit's redo/undo thunk. Raw primitives plus one
+  // adoptSkeleton, per the bulk-edit rule: a per-cube addVoxel loop here would
+  // rebuild every InstancedMesh per cube.
+  function restoreSkeleton(skeleton) {
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(skeleton));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+    } catch (error) {
+      console.error('Undo/redo failed while refilling cubes from the drawing:', error);
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
+      return;
+    }
+    adoptSkeleton(skeleton);
+    updateStatus(mode);
+  }
+
+  // Record a graph-level change (`from` -> `to`) as one undoable step.
+  function recordSkeletonEdit(from, to, label, mergeKey = null) {
+    app.edit({
+      label,
+      mergeKey,
+      redo: () => restoreSkeleton(to),
+      undo: () => restoreSkeleton(from),
+    });
+  }
 
   // --- Persistence glue ----------------------------------------------------
   // persistence.js owns the save FORMAT but knows nothing about this app's
   // state, so everything it writes comes through here. `snapshot()` gathers the
   // three things a save records; the skeleton is rebuilt from `positions`
-  // rather than read from `currentSkeleton` so an autosave always reflects the
+  // rather than read from `currentSkeleton` so a save always reflects the
   // cubes, exactly as before the split.
   function snapshot() {
     return {
@@ -149,27 +165,21 @@ async function main() {
     };
   }
 
-  function saveToLocalStorage() {
-    writeLocalStorage(snapshot());
-  }
-
-  const fileStore = createFileStore(snapshot);
-  const { save, saveAs } = fileStore;
-  // The file store parses; applyLoadedFile decides what the parsed state MEANS.
-  const load = (interpretation = 'cubes') => fileStore.load(interpretation, applyLoadedFile);
-
   function applyLoadedState(state) {
     if (!state) return;
 
-    // Swap the whole voxel set in ONE batch using the raw (non-recomputing)
-    // primitives, then recompute/render the skeleton exactly once at the end.
-    // Using addVoxel/removeVoxel here would recompute the brink skeleton and
-    // rebuild every instanced mesh on EACH cube — O(N²) work plus N redundant
-    // renders — which hangs and crashes the page on large models (e.g. a
-    // 37k-cube realized skeleton).
+    // The graph BEFORE the load, for undo. Swap the whole voxel set in ONE
+    // batch using the raw (non-recomputing) primitives, then recompute the
+    // skeleton exactly once at the end. Using addVoxel/removeVoxel here would
+    // recompute the brink skeleton and rebuild every instanced mesh on EACH
+    // cube — O(N²) work plus N redundant renders — which hangs and crashes the
+    // page on large models (e.g. a 37k-cube realized skeleton).
+    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
-    updateBrinkSkeleton({ record: true, label: 'Load' });
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(before, after, 'Load');
+    adoptSkeleton(after);
 
     faceVisibility.splice(0, 3, ...state.faceVisibility);
     view.applyFaceVisibility();
@@ -179,7 +189,6 @@ async function main() {
     }
 
     updateStatus(mode);
-    saveToLocalStorage();
   }
 
   // A saved file holds an abstract GRAPH (edges + faces) and, optionally, a
@@ -329,66 +338,14 @@ async function main() {
     return true;
   }
 
-  // Push a new state, discarding any redo tail: editing after an undo forks
-  // history, and the abandoned branch is gone.
-  function recordHistory(skeleton, label) {
-    history.entries.length = history.index + 1;
-    history.entries.push({ label, skeleton });
-    history.index = history.entries.length - 1;
-    updateHistoryButtons();
-  }
-
-  const canUndo = () => history.index > 0;
-  const canRedo = () => history.index < history.entries.length - 1;
-
-  function updateHistoryButtons() {
-    undoBtn.disabled = !canUndo();
-    redoBtn.disabled = !canRedo();
-    undoBtn.title = canUndo() ? `Undo ${history.entries[history.index].label}` : 'Nothing to undo';
-    redoBtn.title = canRedo() ? `Redo ${history.entries[history.index + 1].label}` : 'Nothing to redo';
-  }
-
-  // Restore a recorded state. Cubes are refilled from the drawing rather than
-  // stored, using the raw primitives plus a single adoptSkeleton — a per-cube
-  // addVoxel loop here would be O(N²) and rebuild every InstancedMesh per cube.
-  function restoreHistory(i) {
-    const { skeleton } = history.entries[i];
-    history.index = i;
-    try {
-      const cubes = dropOutOfBounds(fillCubesFromSkeleton(skeleton));
-      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
-      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
-    } catch (error) {
-      console.error('Undo/redo failed while refilling cubes from the drawing:', error);
-      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
-      return;
-    }
-    // adoptSkeleton renders the cube geometry from `positions`, so the refill
-    // above must already have happened. Not recorded: restoring is not an edit.
-    adoptSkeleton(skeleton);
-    updateHistoryButtons();
-    updateStatus(mode);
-  }
-
-  function undo() {
-    if (canUndo()) restoreHistory(history.index - 1);
-  }
-
-  function redo() {
-    if (canRedo()) restoreHistory(history.index + 1);
-  }
-
   // Adopt an ALREADY-KNOWN skeleton as the current one: render it, restate the
-  // topology readout, rebuild the cube-face geometry, and persist. Deliberately
-  // does NOT derive the graph — a graph-preserving edit already holds the
-  // graph, and re-deriving it would be both wasteful and lossy (see
-  // applySwapStep).
-  //
-  // `record` is explicit rather than inferred: this function is also called for
-  // non-edits — resyncing the render after a failed drag, and seeding the
-  // initial state — which must not become undoable steps.
-  function adoptSkeleton(skeleton, { record = false, label = '' } = {}) {
-    if (record) recordHistory(skeleton, label);
+  // topology readout, and rebuild the cube-face geometry. Deliberately does NOT
+  // derive the graph — a graph-preserving edit already holds the graph, and
+  // re-deriving it would be both wasteful and lossy (see applySwapStep). Never
+  // records an edit itself — callers push to app.edit() explicitly (see
+  // recordSkeletonEdit) — since this is also called for non-edits: resyncing
+  // the render after a failed drag, and seeding the initial state.
+  function adoptSkeleton(skeleton) {
     currentSkeleton = skeleton;
     // logBrinkSkeleton(skeleton);
     view.renderBrinkSkeleton(skeleton);
@@ -400,35 +357,41 @@ async function main() {
       `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}<br>` +
       `Orientable: ${bipartite ? 'yes' : 'no'}`;
     view.renderBoundaryCubeFaces(positions);
-    saveToLocalStorage();
   }
 
   // The graph-BREAKING path: the cubes are ground truth, so derive the graph
-  // from them and adopt the result. Every voxel add/remove, reset, and load
-  // goes through here.
-  function updateBrinkSkeleton(options) {
-    adoptSkeleton(computeBrinkSkeleton(positions), options);
+  // from them and adopt the result, without recording an edit. Used to seed
+  // the initial render and to resync after a failure; ordinary voxel
+  // add/remove/reset/load record their own edit around this (see below).
+  function updateBrinkSkeleton() {
+    adoptSkeleton(computeBrinkSkeleton(positions));
   }
 
   function reset() {
     // Batch: raw removes/add, then one recompute/render. A per-cube
     // removeVoxel loop is O(N²) and rebuilds every InstancedMesh per cube,
     // which locks up on large models (e.g. a 37k-cube loaded skeleton).
+    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     addVoxelRaw(0, 0, 0);
-    updateBrinkSkeleton({ record: true, label: 'Reset' });
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(before, after, 'Reset');
+    adoptSkeleton(after);
     updateStatus(mode);
   }
 
   function addVoxel(x, y, z) {
     if (!inBounds(x, y, z) || hasVoxel(x, y, z)) return false;
 
+    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
     const idx = positions.length;
     const pos = { x, y, z };
     positions.push(pos);
     occupied.set(key(x, y, z), idx);
 
-    updateBrinkSkeleton({ record: true, label: 'Add cube' });
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(before, after, 'Add cube');
+    adoptSkeleton(after);
     return true;
   }
 
@@ -437,6 +400,7 @@ async function main() {
     const removeIdx = occupied.get(removeKey);
     if (removeIdx === undefined) return false;
 
+    const before = currentSkeleton ?? computeBrinkSkeleton(positions);
     const lastIdx = positions.length - 1;
     const lastPos = positions[lastIdx];
 
@@ -447,7 +411,9 @@ async function main() {
 
     positions.pop();
     occupied.delete(removeKey);
-    updateBrinkSkeleton({ record: true, label: 'Remove cube' });
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(before, after, 'Remove cube');
+    adoptSkeleton(after);
     return true;
   }
 
@@ -477,16 +443,17 @@ async function main() {
     return true;
   }
 
-  // Restore previously saved state, if any: face visibility and camera first
-  // (so the position-restoring addVoxel calls below, which each trigger a
-  // save, re-persist the already-correct values instead of clobbering
-  // them with defaults), then the assembly itself. A `design` URL param, if
-  // present and valid, overrides the autosaved localStorage state. With
-  // nothing saved, fall back to a single cube centered in the build volume.
+  let mode = 'build';
+  let downX = 0;
+  let downY = 0;
+
+  // Restore previously saved state, if any. A `?design=` URL param, when
+  // present and valid, overrides the autosaved draft; with neither, fall back
+  // to a single cube centered in the build volume.
   //
   // loadFromDesignParam throws on a bad URL or unparseable file rather than
   // reporting it itself (persistence.js owns no DOM), so the user-facing
-  // message is raised here and the load falls back to localStorage.
+  // message is raised here and the load falls back to the autosaved draft.
   async function designParamState() {
     try {
       return await loadFromDesignParam();
@@ -497,39 +464,52 @@ async function main() {
       return null;
     }
   }
-  const saved = (await designParamState()) ?? loadFromLocalStorage();
+  // A `?design=` URL, when present and valid, overrides any autosaved draft.
+  // The two can't both be checked synchronously: <design-app>'s app-restore
+  // only fires (asynchronously, on a microtask) once something is listening
+  // for it, so a ?design= state is applied directly here, and the restore
+  // listener is wired up ONLY when there was none — attaching it unconditionally
+  // would race the ?design= state applied above and let whichever settles last
+  // silently win.
+  const saved = await designParamState();
 
-  if (saved?.camera) {
-    view.setCameraState(saved.camera);
+  applyInitialState(saved);
+  if (!saved) {
+    app.addEventListener('app-restore', (event) => {
+      applyInitialState(parseSavedState(event.detail.text));
+    });
   }
 
-  if (saved?.faceVisibility) faceVisibility.splice(0, 3, ...saved.faceVisibility);
-  view.applyFaceVisibility();
+  // Seed the voxel set (and render) from an already-resolved state, or fall
+  // back to a single cube. Used only at startup — an autosaved draft is not a
+  // user edit, so it deliberately does NOT go through recordSkeletonEdit:
+  // <design-app>'s undo stack simply starts empty (Undo disabled) until the
+  // user makes a first real change, which is the correct "nothing to undo yet"
+  // state.
+  function applyInitialState(state) {
+    if (state?.camera) view.setCameraState(state.camera);
+    if (state?.faceVisibility) faceVisibility.splice(0, 3, ...state.faceVisibility);
+    view.applyFaceVisibility();
 
-  // Restore the initial voxel set in ONE batch (raw adds, then a single
-  // recompute/render) — a per-cube addVoxel loop here is O(N²) and rebuilds
-  // every InstancedMesh per cube, hanging startup on large saved models.
-  // Autosaves now carry the drawing rather than the cubes, but an autosave
-  // written by an older build (positions only) must still restore — so accept
-  // either shape, preferring the drawing.
-  const restored = saved
-    ? hasDrawing(saved)
-      ? dropOutOfBounds(fillCubesFromSkeleton(saved.skeleton))
-      : saved.positions
-    : null;
+    // Restore the voxel set in ONE batch (raw adds, then a single
+    // recompute/render) — a per-cube addVoxel loop here is O(N²) and rebuilds
+    // every InstancedMesh per cube, hanging startup on large saved models.
+    // Prefer the drawing over stored cubes when both are present.
+    const restored = state
+      ? hasDrawing(state)
+        ? dropOutOfBounds(fillCubesFromSkeleton(state.skeleton))
+        : state.positions
+      : null;
 
-  if (restored?.length) {
-    for (const { x, y, z } of restored) addVoxelRaw(x, y, z);
-  } else {
-    addVoxelRaw(0, 0, 0);
+    for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+    if (restored?.length) {
+      for (const { x, y, z } of restored) addVoxelRaw(x, y, z);
+    } else {
+      addVoxelRaw(0, 0, 0);
+    }
+    updateBrinkSkeleton();
+    updateStatus(mode);
   }
-  // Seed history with the starting state so the first undo has somewhere to
-  // return to. Recorded as the base entry, not as an edit the user made.
-  updateBrinkSkeleton({ record: true, label: 'Initial state' });
-
-  let mode = 'build';
-  let downX = 0;
-  let downY = 0;
 
   function setMode(nextMode) {
     mode = nextMode;
@@ -769,10 +749,10 @@ async function main() {
   // confusing to read, since the shell is the shape you are actually editing.
   //
   // This is the per-STEP cost, not the per-pointermove cost — steps fire only
-  // on plane crossings. It deliberately does NOT go through adoptSkeleton:
-  // history and localStorage belong to the commit, not to each intermediate
-  // state of a gesture in flight. `currentSkeleton` is left alone too; the
-  // drag owns its own drawing until it commits.
+  // on plane crossings. It deliberately does NOT go through adoptSkeleton: the
+  // undo edit belongs to the commit, not to each intermediate state of a
+  // gesture in flight. `currentSkeleton` is left alone too; the drag owns its
+  // own drawing until it commits.
   //
   // Bulk voxel rules from CLAUDE.md apply: raw primitives only, and exactly one
   // render at the end.
@@ -834,13 +814,15 @@ async function main() {
     // `positions` is ALREADY correct: redrawDragStep refilled it after the last
     // applied step, and no step is left unrendered. So the commit does not
     // refill — it only does the things a gesture in flight deliberately skips:
-    // adopt the drawing as current, record one history entry for the whole
-    // gesture, and persist.
+    // adopt the drawing as current and record one edit for the whole gesture
+    // (the redo/undo thunks refill on demand via restoreSkeleton, same as
+    // every other edit).
     //
     // Cubes are derived purely to render, pick, and export — they are not
     // consulted to rebuild the graph, so `adoptSkeleton` (not
     // `updateBrinkSkeleton`) takes the graph we already hold.
-    adoptSkeleton(skeleton, { record: true, label: 'Move face' });
+    recordSkeletonEdit(baseSkeleton, skeleton, 'Move face');
+    adoptSkeleton(skeleton);
     updateStatus(mode);
   }
 
@@ -873,31 +855,45 @@ async function main() {
 
   buildBtn.addEventListener('click', () => setMode('build'));
   destroyBtn.addEventListener('click', () => setMode('destroy'));
-  resetBtn.addEventListener('click', () => reset());
   moveBtn.addEventListener('click', () => toggleMoveMode());
-  undoBtn.addEventListener('click', () => undo());
-  redoBtn.addEventListener('click', () => redo());
-
-  saveBtn.addEventListener('click', () => save());
-  saveAsBtn.addEventListener('click', () => saveAs());
-  loadBtn.addEventListener('click', () => load('cubes'));
-  loadAbstractBtn.addEventListener('click', () => load('abstract'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
-  // Cmd/Ctrl+Z to undo, Cmd/Ctrl+Shift+Z or Ctrl+Y to redo. Suspended while a
-  // realization is running or a drag is in flight, matching the edit guards.
-  window.addEventListener('keydown', (event) => {
-    if (realizer.isBusy() || drag || trapped) return;
-    const accel = event.metaKey || event.ctrlKey;
-    if (!accel) return;
-    const key = event.key.toLowerCase();
-    if (key === 'z') {
-      event.preventDefault();
-      if (event.shiftKey) redo();
-      else undo();
-    } else if (key === 'y') {
-      event.preventDefault();
-      redo();
+  // <design-app> drives undo/redo (button + keyboard), Save/Save As, and the
+  // File menu's Open/New; the app only has to serialize and deserialize its
+  // own document and apply the result.
+  app.addEventListener('app-save', (event) => {
+    event.detail.setText(serialize(snapshot()));
+  });
+
+  app.addEventListener('app-open', (event) => {
+    const state = parseSavedState(event.detail.text);
+    if (!state) {
+      alert(`Could not open ${event.detail.name}: not a valid Orthohedra save.`);
+      return;
+    }
+    applyLoadedFile(state, 'cubes');
+  });
+
+  app.addEventListener('app-new', () => {
+    reset();
+    view.centerView(positions);
+  });
+
+  // Custom menu items: things the component's own File/Edit menus don't
+  // cover. "Load Abstract…" is a distinct interpretation of an opened file
+  // (re-realize coordinates from a coordinate-free graph), not a plain open.
+  // "Center View" only pans/zooms the camera onto the model — the model
+  // itself is untouched, so it is not an undoable edit.
+  app.setMenu([
+    { id: 'load-abstract', label: 'Load Abstract…' },
+    { id: 'center-view', label: 'Center View' },
+  ]);
+  app.addEventListener('menu-select', async (event) => {
+    if (event.detail.id === 'load-abstract') {
+      const state = await pickAndParseFile();
+      if (state) applyLoadedFile(state, 'abstract');
+    } else if (event.detail.id === 'center-view') {
+      view.centerView(positions);
     }
   });
 
@@ -954,15 +950,6 @@ async function main() {
   window.addEventListener('resize', () => view.handleResize());
 
   updateStatus(mode);
-
-  // OrbitControls fires "change" continuously while dragging or during
-  // damped inertial settling — debounce so camera moves don't spam
-  // localStorage writes on every frame, only once motion has settled.
-  let cameraSaveTimeout = null;
-  view.onCameraChange(() => {
-    clearTimeout(cameraSaveTimeout);
-    cameraSaveTimeout = setTimeout(saveToLocalStorage, 300);
-  });
 
   view.start();
 }

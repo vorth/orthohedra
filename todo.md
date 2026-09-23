@@ -3,11 +3,19 @@
 ## must have
 
 - better topology metrics
-- graph-preserving and -breaking modes
+  - Euler per-component
+  - face counts by size
+- count of unit squares
+- modes
+  - cubes
+  - graph
+  - move
+- custom face coloring
+- custom default colors
 
 ## nice to have
 
-- app framework
+- custom square coloring
 
 - change rendering controls:
   - modifier keys for mouse
@@ -15,7 +23,9 @@
 - change mode controls
   - modifier keys for mouse
   - mode selector for touch
+
 - fix layout for phones
+
 - condense / dilate functions
 
 - vertex fuse
