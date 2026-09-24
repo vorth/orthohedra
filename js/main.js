@@ -13,6 +13,7 @@ import {
   updateSwapIndex,
   planeOfFace,
 } from "./faceGeometry.js";
+import { pickFaceForSquare } from "./faceColoring.js";
 import { createRealizer } from "./realization.js";
 import { serialize, parseSavedState, pickAndParseFile, loadFromDesignParam } from "./persistence.js";
 import { createSceneRenderer } from "./sceneRenderer.js";
@@ -23,6 +24,9 @@ const statusEl = document.getElementById('status');
 const skeletonStatsEl = document.getElementById('skeletonStats');
 const cubesBtn = document.getElementById('cubesBtn');
 const graphBtn = document.getElementById('graphBtn');
+const colorModeBtn = document.getElementById('colorModeBtn');
+const colorPanel = document.getElementById('colorPanel');
+const colorSwatch = document.getElementById('colorSwatch');
 const busyOverlay = document.getElementById('busyOverlay');
 const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
@@ -48,8 +52,37 @@ async function main() {
   // Starts null (not 'cubes') so the first setMode() call in applyInitialState
   // always applies its visual side effects (button state, skeleton
   // visibility) instead of short-circuiting on an already-equal mode.
+  //
+  // Three states, not two independent signals (a mode plus a coloring flag):
+  // 'cubes' | 'graph' | 'graph-coloring'. Graph Coloring is a mode in its own
+  // right, not an overlay atop Graph — every transition (including
+  // graph-coloring -> graph directly, which a separate "coloring" boolean
+  // handled inconsistently, since setMode('graph') short-circuited on
+  // mode==='graph' already being true and never reached the code that turned
+  // coloring off) goes through the SAME setMode(), so there's exactly one
+  // place that decides what's visible/clickable for any given state.
   let mode = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
+  // Both graph-y modes render the skeleton overlay and allow custom colors;
+  // only 'graph-coloring' also enables the color-click interaction.
+  const isGraphy = (m) => m === 'graph' || m === 'graph-coloring';
+
+  // Custom face colors: faceKey -> hex color string. Authored content, not a
+  // rendering choice (unlike faceVisibility), so it participates in undo/redo
+  // and persistence. Held by reference and mutated in place (never
+  // reassigned) so every consumer (snapshot(), applyLoadedState, undo/redo)
+  // shares one object without re-wiring. Reconciled in adoptSkeleton(): a
+  // faceKey is a deterministic function of the sorted vertex-coordinate set
+  // (see brinkSkeleton.js's "Element identity" comment), so pruning entries
+  // absent from the fresh skeleton's byFaceKey is always correct when it
+  // keeps an entry, never a guess.
+  const faceColors = new Map();
+
+  function pruneFaceColors(skeleton) {
+    for (const key of [...faceColors.keys()]) {
+      if (!skeleton.byFaceKey.has(key)) faceColors.delete(key);
+    }
+  }
 
   // Drag state for both modes, declared up front: setMode() (called from
   // applyInitialState() during startup, before either drag's own section
@@ -122,6 +155,52 @@ async function main() {
     return best; // null if no in-plane bounding face was found (shouldn't happen)
   }
 
+  // Color-mode click resolution: which graph face does a clicked boundary
+  // square belong to? Unlike connectedFace (nearest-edge distance — right
+  // for "which face did you grab near"), this needs actual containment —
+  // the clicked square can be deep inside a large face, far from any edge —
+  // so it uses the same ownership rule the renderer uses to paint squares
+  // (pickFaceForSquare/resolveSquareOwners): every face coplanar with the
+  // clicked square is a candidate, and among those whose naive interior
+  // contains it, the one with the LARGEST naive interior wins (see
+  // faceColoring.js's resolveSquareOwners for why — a small face's own hole
+  // boundary can sit entirely inside a much bigger ambient face's interior,
+  // and the ambient face should win, not whichever is found first).
+  function faceKeyForClickedSquare(axis, instanceId) {
+    if (!currentSkeleton) return null;
+    const info = view.boundaryFaceInfo(axis)[instanceId];
+    if (!info) return null;
+    const coord = Math.round(info.center[axis]);
+    const [ua, ub] = inPlaneAxes(axis);
+    const u = Math.round(info.center[ua] - 0.5);
+    const v = Math.round(info.center[ub] - 0.5);
+
+    const isBoundarySquare = (cu, cv) => squareIsBoundary(axis, coord, cu, cv);
+
+    const candidates = [];
+    for (let faceIdx = 0; faceIdx < currentSkeleton.faces.length; faceIdx++) {
+      const projected = projectFace(currentSkeleton, faceIdx, axis);
+      if (!projected || projected.coord !== coord) continue;
+      candidates.push({ key: currentSkeleton.faceKeys[faceIdx], segments: projected.segments });
+    }
+    return pickFaceForSquare(candidates, [u, v], isBoundarySquare);
+  }
+
+  // Whether the unit square at in-plane (u,v) on `axis` at plane `coord` is
+  // an actual rendered boundary face: exactly one of the two cubes adjoining
+  // that plane (at coord-1 and coord along axis) is filled. Mirrors
+  // computeBoundaryCubeFaces's own boundary test.
+  function squareIsBoundary(axis, coord, u, v) {
+    const [ua, ub] = inPlaneAxes(axis);
+    const lo = [0, 0, 0];
+    const hi = [0, 0, 0];
+    lo[axis] = coord - 1;
+    hi[axis] = coord;
+    lo[ua] = hi[ua] = u;
+    lo[ub] = hi[ub] = v;
+    return hasVoxel(lo[0], lo[1], lo[2]) !== hasVoxel(hi[0], hi[1], hi[2]);
+  }
+
   const occupied = new Map();
   const positions = [];
 
@@ -147,8 +226,10 @@ async function main() {
   // Refill `positions` from a skeleton snapshot and adopt it as current — the
   // shared body of every edit's redo/undo thunk. Raw primitives plus one
   // adoptSkeleton, per the bulk-edit rule: a per-cube addVoxel loop here would
-  // rebuild every InstancedMesh per cube.
-  function restoreSkeleton(skeleton) {
+  // rebuild every InstancedMesh per cube. `colors`, if given, is restored
+  // AFTER adoptSkeleton (which prunes faceColors against the new skeleton) so
+  // the restored entries aren't immediately pruned by the stale one.
+  function restoreSkeleton(skeleton, colors = null) {
     try {
       const cubes = dropOutOfBounds(fillCubesFromSkeleton(skeleton));
       for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
@@ -159,16 +240,28 @@ async function main() {
       return;
     }
     adoptSkeleton(skeleton);
+    if (colors) {
+      faceColors.clear();
+      for (const [k, v] of colors) faceColors.set(k, v);
+      if (isGraphy(mode)) view.renderBoundaryCubeFaces(positions, { skeleton, faceColors });
+    }
     updateStatus();
   }
 
-  // Record a graph-level change (`from` -> `to`) as one undoable step.
-  function recordSkeletonEdit(from, to, label, mergeKey = null) {
+  // Record a graph-level change (`from` -> `to`) as one undoable step. Custom
+  // face colors are authored content, not a rendering choice (unlike
+  // faceVisibility), so undo/redo snapshots them alongside the skeleton —
+  // `fromColors`/`toColors` default to the CURRENT faceColors, since most
+  // callers (voxel edits) don't touch colors at all and just want them
+  // preserved across the undo boundary unchanged.
+  function recordSkeletonEdit(from, to, label, mergeKey = null, fromColors = null, toColors = null) {
+    const snapshotFrom = fromColors ?? new Map(faceColors);
+    const snapshotTo = toColors ?? new Map(faceColors);
     app.edit({
       label,
       mergeKey,
-      redo: () => restoreSkeleton(to),
-      undo: () => restoreSkeleton(from),
+      redo: () => restoreSkeleton(to, snapshotTo),
+      undo: () => restoreSkeleton(from, snapshotFrom),
     });
   }
 
@@ -182,6 +275,7 @@ async function main() {
     return {
       skeleton: computeBrinkSkeleton(positions),
       faceVisibility,
+      faceColors: Object.fromEntries(faceColors),
       camera: view.getCameraState(),
     };
   }
@@ -196,10 +290,14 @@ async function main() {
     // cube — O(N²) work plus N redundant renders — which hangs and crashes the
     // page on large models (e.g. a 37k-cube realized skeleton).
     const before = currentSkeleton ?? computeBrinkSkeleton(positions);
+    const beforeColors = new Map(faceColors);
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
     const after = computeBrinkSkeleton(positions);
-    recordSkeletonEdit(before, after, 'Load');
+    const afterColors = new Map(Object.entries(state.faceColors ?? {}).filter(([k]) => after.byFaceKey.has(k)));
+    recordSkeletonEdit(before, after, 'Load', null, beforeColors, afterColors);
+    faceColors.clear();
+    for (const [k, v] of afterColors) faceColors.set(k, v);
     adoptSkeleton(after);
 
     faceVisibility.splice(0, 3, ...state.faceVisibility);
@@ -368,6 +466,7 @@ async function main() {
   // the render after a failed drag, and seeding the initial state.
   function adoptSkeleton(skeleton) {
     currentSkeleton = skeleton;
+    pruneFaceColors(skeleton);
     // logBrinkSkeleton(skeleton);
     view.renderBrinkSkeleton(skeleton);
     const V = skeleton.vertices.length;
@@ -377,7 +476,11 @@ async function main() {
     skeletonStatsEl.innerHTML =
       `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}<br>` +
       `Orientable: ${bipartite ? 'yes' : 'no'}`;
-    view.renderBoundaryCubeFaces(positions);
+    // Custom colors are a graph-y-mode-only concept; pass them only when the
+    // mode has actually settled into one (during startup, mode is still
+    // null on the very first adoptSkeleton call, which is fine — nothing has
+    // colors yet).
+    view.renderBoundaryCubeFaces(positions, isGraphy(mode) ? { skeleton, faceColors } : null);
   }
 
   // The graph-BREAKING path: the cubes are ground truth, so derive the graph
@@ -393,10 +496,12 @@ async function main() {
     // removeVoxel loop is O(N²) and rebuilds every InstancedMesh per cube,
     // which locks up on large models (e.g. a 37k-cube loaded skeleton).
     const before = currentSkeleton ?? computeBrinkSkeleton(positions);
+    const beforeColors = new Map(faceColors);
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     addVoxelRaw(0, 0, 0);
     const after = computeBrinkSkeleton(positions);
-    recordSkeletonEdit(before, after, 'Reset');
+    recordSkeletonEdit(before, after, 'Reset', null, beforeColors, new Map());
+    faceColors.clear();
     adoptSkeleton(after);
     updateStatus();
   }
@@ -494,10 +599,15 @@ async function main() {
     } else {
       addVoxelRaw(0, 0, 0);
     }
-    updateBrinkSkeleton();
+    faceColors.clear();
+    for (const [k, v] of Object.entries(state?.faceColors ?? {})) faceColors.set(k, v);
+    updateBrinkSkeleton(); // prunes faceColors against the freshly derived skeleton
     setMode(restored?.length ? 'graph' : 'cubes');
   }
 
+  // nextMode is 'cubes' | 'graph' | 'graph-coloring'. The single source of
+  // truth for what's visible/clickable in each state — every transition,
+  // including graph <-> graph-coloring, goes through here.
   function setMode(nextMode) {
     if (mode === nextMode) return;
     cancelGraphDrag(); // abandon any in-flight graph-mode drag
@@ -505,12 +615,19 @@ async function main() {
     mode = nextMode;
     cubesBtn.classList.toggle('active', mode === 'cubes');
     graphBtn.classList.toggle('active', mode === 'graph');
-    // Skeleton edges/vertices are graph-mode-only; cubes mode shows only cube
-    // faces, outlined in black instead (see CLAUDE.md's Two modes note —
-    // Gp/Gb are visually distinct).
-    view.setSkeletonVisible(mode === 'graph');
+    colorModeBtn.classList.toggle('active', mode === 'graph-coloring');
+    colorPanel.hidden = mode !== 'graph-coloring';
+    // Skeleton edges/vertices render for both graph-y modes; cubes mode
+    // shows only cube faces, outlined in black instead (see CLAUDE.md's Two
+    // modes note — Gp/Gb are visually distinct).
+    view.setSkeletonVisible(isGraphy(mode));
     view.setCubeEdgesVisible(mode === 'cubes');
     view.hideHoverOutline();
+    // Custom colors only ever show in a graph-y mode — repaint the boundary
+    // faces so switching modes flips them on/off immediately.
+    if (currentSkeleton) {
+      view.renderBoundaryCubeFaces(positions, isGraphy(mode) ? { skeleton: currentSkeleton, faceColors } : null);
+    }
     updateStatus();
   }
 
@@ -711,7 +828,12 @@ async function main() {
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
     view.renderBrinkSkeleton(drag.skeleton);
-    view.renderBoundaryCubeFaces(positions);
+    // The drag's own live skeleton, not currentSkeleton (stale until
+    // commit) — faceKeys are carried forward by reference through a
+    // graph-preserving drag (see faceGeometry.js's applySwapStep), so
+    // faceColors entries keyed on them remain valid mid-drag with no pruning
+    // needed here.
+    view.renderBoundaryCubeFaces(positions, { skeleton: drag.skeleton, faceColors });
   }
 
   function updateGraphDrag(clientX, clientY) {
@@ -931,6 +1053,7 @@ async function main() {
 
   cubesBtn.addEventListener('click', () => setMode('cubes'));
   graphBtn.addEventListener('click', () => setMode('graph'));
+  colorModeBtn.addEventListener('click', () => setMode(mode === 'graph-coloring' ? 'graph' : 'graph-coloring'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
   // <design-app> drives undo/redo (button + keyboard), Save/Save As, and the
@@ -973,19 +1096,41 @@ async function main() {
     }
   });
 
+  // Color-mode click: resolve the clicked square's enclosing graph face and
+  // assign it the current swatch color, as one undoable edit (colors are
+  // authored content, like a voxel edit — see the faceColors declaration).
+  // The skeleton itself doesn't change, so `from`/`to` are both the current
+  // skeleton — only the color snapshots differ.
+  function colorClickedFace(axis, instanceId) {
+    const faceKeyStr = faceKeyForClickedSquare(axis, instanceId);
+    if (!faceKeyStr) return;
+    const before = new Map(faceColors);
+    faceColors.set(faceKeyStr, colorSwatch.value);
+    const after = new Map(faceColors);
+    recordSkeletonEdit(currentSkeleton, currentSkeleton, 'Color face', null, before, after);
+    view.renderBoundaryCubeFaces(positions, { skeleton: currentSkeleton, faceColors });
+  }
+
   view.domElement.addEventListener('pointerdown', (event) => {
     downX = event.clientX;
     downY = event.clientY;
     if (realizer.isBusy()) return;
 
-    if (mode === 'graph') {
-      // Grabbing ANY visible boundary face starts a drag along that face's
-      // normal axis, and suspends the trackball so the camera doesn't rotate
-      // mid-drag. The axis is whichever face mesh was hit.
+    if (isGraphy(mode)) {
       const hit = view.getIntersection(event.clientX, event.clientY)[0];
       if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
         const axis = view.faceMeshAxis(hit.object);
-        if (axis !== -1 && startGraphDrag(axis, hit.instanceId, hit.point)) {
+        if (axis === -1) return;
+        if (mode === 'graph-coloring') {
+          colorClickedFace(axis, hit.instanceId);
+          view.hideHoverOutline();
+          event.preventDefault();
+          return;
+        }
+        // Grabbing ANY visible boundary face starts a drag along that
+        // face's normal axis, and suspends the trackball so the camera
+        // doesn't rotate mid-drag. The axis is whichever face mesh was hit.
+        if (startGraphDrag(axis, hit.instanceId, hit.point)) {
           view.hideHoverOutline();
           event.preventDefault();
         }

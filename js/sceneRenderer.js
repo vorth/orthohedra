@@ -21,7 +21,8 @@ import { Line2 } from "https://esm.sh/three@0.172.0/examples/jsm/lines/Line2.js"
 import { LineMaterial } from "https://esm.sh/three@0.172.0/examples/jsm/lines/LineMaterial.js";
 import { LineSegmentsGeometry } from "https://esm.sh/three@0.172.0/examples/jsm/lines/LineSegmentsGeometry.js";
 import { computeBoundaryCubeFaces } from "./brinkSkeleton.js";
-import { inPlaneAxes } from "./faceGeometry.js";
+import { inPlaneAxes, projectFace } from "./faceGeometry.js";
+import { resolvePlaneColors } from "./faceColoring.js";
 import {
   MIN,
   MAX,
@@ -197,12 +198,25 @@ export function createSceneRenderer(app) {
   }
 
   const faceGeometry = new THREE.PlaneGeometry(1, 1);
-  // Each axis's faces are tinted with that axis's FACE_COLORS shade (X red,
-  // Y yellow, Z blue, lightened slightly toward white).
+  // Material color is plain white on all 3 axes: the actual tint (each
+  // axis's FACE_COLORS shade by default, or a custom per-face color) lives
+  // entirely in per-instance color (see renderBoundaryCubeFaces), multiplied
+  // against this white base — white times anything is that thing, so no tint
+  // math is needed to layer a custom color over the default.
+  //
+  // Deliberately NOT `vertexColors: true`: that flag defines USE_COLOR in
+  // the shader regardless of whether the GEOMETRY has a `color` attribute
+  // (WebGLPrograms passes material.vertexColors straight through, with no
+  // check for geometry.attributes.color). This geometry has no such
+  // attribute — only per-INSTANCE color via setColorAt — so USE_COLOR would
+  // read a phantom all-zero vColor and multiply every face to black.
+  // InstancedMesh's own instance-color path (USE_INSTANCING_COLOR) is gated
+  // purely on `mesh.instanceColor !== null`, independent of
+  // material.vertexColors, so leaving this false is correct and sufficient.
   const cubeFaceMaterials = [0, 1, 2].map(
-    (axis) =>
+    () =>
       new THREE.MeshStandardMaterial({
-        color: FACE_COLORS[axis],
+        color: 0xffffff,
         roughness: 0.64,
         metalness: 0.05,
         transparent: true,
@@ -281,14 +295,71 @@ export function createSceneRenderer(app) {
     ],
   ];
 
-  function renderBoundaryCubeFaces(cubePositions) {
+  const faceTempColor = new THREE.Color();
+
+  // Per-axis, per-plane resolved custom colors: axis -> Map(coord -> Map("u,v" -> color)).
+  // Built once per renderBoundaryCubeFaces call from `colorContext`, which
+  // carries the current skeleton and the faceKey->color map — null in Cubes
+  // mode, where custom colors never apply.
+  function resolveCustomColors(colorContext, byAxis) {
+    const resolvedByAxis = [null, null, null];
+    if (!colorContext || !colorContext.faceColors.size) return resolvedByAxis;
+    const { skeleton, faceColors } = colorContext;
+
+    for (let axis = 0; axis < 3; axis++) {
+      // Boundary squares in this axis's planes, keyed by "coord,u,v", for the
+      // naive fill's isBoundarySquare gate.
+      const [ua, ub] = inPlaneAxes(axis);
+      const boundarySet = new Set();
+      for (const face of byAxis[axis]) {
+        const coord = Math.round(face.center[axis]);
+        const u = Math.round(face.center[ua] - 0.5);
+        const v = Math.round(face.center[ub] - 0.5);
+        boundarySet.add(`${coord},${u},${v}`);
+      }
+      if (!boundarySet.size) continue;
+
+      // Custom-colored faces normal to this axis, grouped by plane coord.
+      const coloredByCoord = new Map();
+      for (let faceIdx = 0; faceIdx < skeleton.faces.length; faceIdx++) {
+        const faceKeyStr = skeleton.faceKeys[faceIdx];
+        const color = faceColors.get(faceKeyStr);
+        if (!color) continue;
+        const projected = projectFace(skeleton, faceIdx, axis);
+        if (!projected) continue;
+        if (!coloredByCoord.has(projected.coord)) coloredByCoord.set(projected.coord, []);
+        coloredByCoord.get(projected.coord).push({ key: faceKeyStr, color, segments: projected.segments });
+      }
+      if (!coloredByCoord.size) continue;
+
+      const resolvedByCoord = new Map();
+      for (const [coord, coloredFaces] of coloredByCoord) {
+        const isBoundarySquare = (u, v) => boundarySet.has(`${coord},${u},${v}`);
+        resolvedByCoord.set(coord, resolvePlaneColors(coloredFaces, isBoundarySquare));
+      }
+      resolvedByAxis[axis] = resolvedByCoord;
+    }
+    return resolvedByAxis;
+  }
+
+  /**
+   * @param {Array<{x:number,y:number,z:number}>} cubePositions
+   * @param {{ skeleton: object, faceColors: Map<string,string> } | null} colorContext
+   *   - the current skeleton and custom face-color map, or null to render
+   *   every square with its default axis color (Cubes mode).
+   */
+  function renderBoundaryCubeFaces(cubePositions, colorContext = null) {
     const boundaryFaces = computeBoundaryCubeFaces(cubePositions);
     const byAxis = [[], [], []];
     for (const face of boundaryFaces) byAxis[face.axis].push(face);
     boundaryFaceInfoByAxis = byAxis;
 
+    const resolvedByAxis = resolveCustomColors(colorContext, byAxis);
+
     for (let axis = 0; axis < 3; axis++) {
       const axisFaces = byAxis[axis];
+      const [ua, ub] = inPlaneAxes(axis);
+      const resolved = resolvedByAxis[axis];
       const mesh = ensureInstanceCapacity(cubeFaceMeshes, axis, axisFaces.length);
       mesh.count = axisFaces.length;
       const edgeMesh = ensureInstanceCapacity(cubeEdgeMeshes, axis, axisFaces.length);
@@ -303,9 +374,20 @@ export function createSceneRenderer(app) {
         mesh.setMatrixAt(i, faceTempMatrix);
         edgeMesh.setMatrixAt(i, faceTempMatrix);
         slots.set(faceKey(x, y, z, sign), i);
+
+        let customColor;
+        if (resolved) {
+          const coord = Math.round(center[axis]);
+          const u = Math.round(center[ua] - 0.5);
+          const v = Math.round(center[ub] - 0.5);
+          customColor = resolved.get(coord)?.get(`${u},${v}`);
+        }
+        faceTempColor.set(customColor ?? FACE_COLORS[axis]);
+        mesh.setColorAt(i, faceTempColor);
       }
       mesh.instanceMatrix.needsUpdate = true;
       edgeMesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       // InstancedMesh caches a bounding sphere for raycasting that isn't
       // automatically invalidated when instances move or `count`
       // changes — recompute it here or hover/click detection can
@@ -334,7 +416,9 @@ export function createSceneRenderer(app) {
   const dirtyBoundaryAxes = new Set();
 
   // Appends one face instance to the end of its axis mesh (and its edge-outline
-  // counterpart, kept at the same slot index).
+  // counterpart, kept at the same slot index). Only ever used by the
+  // Cubes-mode drag, where custom colors never apply, so this always writes
+  // the default axis color — never a face's custom override.
   function addBoundaryFace(x, y, z, axis, sign, center) {
     const mesh = ensureInstanceCapacity(cubeFaceMeshes, axis, boundaryFaceInfoByAxis[axis].length + 1);
     const edgeMesh = ensureInstanceCapacity(cubeEdgeMeshes, axis, boundaryFaceInfoByAxis[axis].length + 1);
@@ -346,8 +430,11 @@ export function createSceneRenderer(app) {
     faceTempMatrix.compose(faceTempPosition, faceQuaternions[axis][signIdx], faceTempScale);
     mesh.setMatrixAt(i, faceTempMatrix);
     edgeMesh.setMatrixAt(i, faceTempMatrix);
+    faceTempColor.set(FACE_COLORS[axis]);
+    mesh.setColorAt(i, faceTempColor);
     mesh.instanceMatrix.needsUpdate = true;
     edgeMesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     boundaryFaceInfoByAxis[axis].push({ x, y, z, axis, sign, center });
     faceSlotByAxis[axis].set(faceKey(x, y, z, sign), i);
     dirtyBoundaryAxes.add(axis);

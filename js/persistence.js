@@ -32,6 +32,13 @@ const LEGACY_RENDER_MODE_VISIBILITY = {
 const isFaceVisibility = (v) =>
   Array.isArray(v) && v.length === 3 && v.every((s) => s === FACE_SOLID || s === FACE_TRANSLUCENT || s === FACE_HIDDEN);
 
+// faceKey -> hex color string, custom Graph-mode face colors. A plain object
+// (not a Map — Maps serialize to "{}"), validated loosely: any object whose
+// values are all strings. Malformed entries are dropped individually rather
+// than discarding the whole map, since a single corrupted entry shouldn't
+// cost the rest of a hand-edited or partially-corrupted file.
+const isFaceColors = (v) => v && typeof v === 'object' && !Array.isArray(v);
+
 // What we persist is an abstract GRAPH (edges + faces) together with a
 // DRAWING of it (vertex coordinates) — the mathematically meaningful
 // content. Cubes are a derivation of the drawing and are NOT saved: for the
@@ -46,14 +53,20 @@ const isFaceVisibility = (v) =>
 // whatever computeBrinkSkeleton returned, `faceVisibility` the tri-state array,
 // and `camera` the two coordinate triples. Building the skeleton is the
 // caller's job, which keeps the save format independent of how it was derived.
-export function serialize({ skeleton, faceVisibility, camera }) {
+export function serialize({ skeleton, faceVisibility, faceColors, camera }) {
   // Persist only the graph and its drawing. The identity fields that
   // computeBrinkSkeleton also returns (ids, keys, lookup Maps) are derived —
   // and Maps would serialize to `{}` — so they stay out of the file.
+  // faceColors is keyed by those same faceKeys, which the graph regenerates
+  // deterministically from the drawing (see brinkSkeleton.js's "Element
+  // identity" comment), so persisting it as a plain faceKey->color object
+  // alongside the graph is enough to round-trip: no separate identity data
+  // needed.
   const { vertices, edges, faces } = skeleton;
   const state = {
     skeleton: { vertices, edges, faces },
     faceVisibility,
+    faceColors,
     camera,
   };
   return JSON.stringify(state, null, 2);
@@ -80,6 +93,12 @@ export function parseSavedState(raw) {
     const faceVis = isFaceVisibility(parsed.faceVisibility)
       ? parsed.faceVisibility
       : LEGACY_RENDER_MODE_VISIBILITY[parsed.renderMode] ?? [FACE_SOLID, FACE_SOLID, FACE_SOLID];
+
+    // Custom face colors: keep only string-valued entries, drop the rest
+    // individually rather than discarding the whole map.
+    const faceColors = isFaceColors(parsed.faceColors)
+      ? Object.fromEntries(Object.entries(parsed.faceColors).filter(([, v]) => typeof v === 'string'))
+      : {};
 
     const isVector3Array = (v) => Array.isArray(v) && v.length === 3 && v.every((n) => Number.isFinite(n));
     // `up` is optional: states saved before it was persisted lack it, and
@@ -146,7 +165,7 @@ export function parseSavedState(raw) {
       };
     }
 
-    return { positions, faceVisibility: faceVis, camera: cameraState, skeleton };
+    return { positions, faceVisibility: faceVis, faceColors, camera: cameraState, skeleton };
   } catch {
     return null;
   }
