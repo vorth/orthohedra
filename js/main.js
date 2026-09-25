@@ -1,4 +1,4 @@
-import { computeBrinkSkeleton, logBrinkSkeleton } from "./brinkSkeleton.js";
+import { computeBrinkSkeleton, keySkeleton, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 import { MIN, MAX, inBounds } from "./constants.js";
 import {
@@ -267,13 +267,24 @@ async function main() {
 
   // --- Persistence glue ----------------------------------------------------
   // persistence.js owns the save FORMAT but knows nothing about this app's
-  // state, so everything it writes comes through here. `snapshot()` gathers the
-  // three things a save records; the skeleton is rebuilt from `positions`
-  // rather than read from `currentSkeleton` so a save always reflects the
-  // cubes, exactly as before the split.
+  // state, so everything it writes comes through here. `snapshot()` gathers
+  // what a save records. The skeleton comes from `currentSkeleton`, not a
+  // fresh `computeBrinkSkeleton(positions)` call: `faceColors` is keyed by
+  // `currentSkeleton`'s faceKeys, which a graph-preserving (Gp) drag carries
+  // forward BY REFERENCE rather than re-deriving — and a fresh recompute can
+  // assign a DIFFERENT key to the same geometric face once any vertex has
+  // crossed another's position in the lexicographic sort (see
+  // brinkSkeleton.js's "Element identity" comment: "two skeletons of the
+  // same shape may carry different keys"). Serializing a freshly-recomputed
+  // skeleton alongside faceColors keyed against the live one silently wrote
+  // two mismatched keyings into the same file — on load, `byFaceKey.has(k)`
+  // would then drop every color whose key didn't survive the mismatch.
+  // `currentSkeleton` is always kept in lockstep with `positions` by
+  // `adoptSkeleton` (every positions-mutating path calls it before any save
+  // could observe the result), so reading it directly loses nothing.
   function snapshot() {
     return {
-      skeleton: computeBrinkSkeleton(positions),
+      skeleton: currentSkeleton ?? computeBrinkSkeleton(positions),
       faceVisibility,
       faceColors: Object.fromEntries(faceColors),
       camera: view.getCameraState(),
@@ -284,7 +295,7 @@ async function main() {
     if (!state) return;
 
     // The graph BEFORE the load, for undo. Swap the whole voxel set in ONE
-    // batch using the raw (non-recomputing) primitives, then recompute the
+    // batch using the raw (non-recomputing) primitives, then adopt the
     // skeleton exactly once at the end. Using addVoxel/removeVoxel here would
     // recompute the brink skeleton and rebuild every instanced mesh on EACH
     // cube — O(N²) work plus N redundant renders — which hangs and crashes the
@@ -293,7 +304,19 @@ async function main() {
     const beforeColors = new Map(faceColors);
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of state.positions) addVoxelRaw(x, y, z);
-    const after = computeBrinkSkeleton(positions);
+    // The graph, not the cubes, is the source of truth: when the loaded file
+    // carries a real drawing (hasDrawing — not an abstract-realized one,
+    // whose coordinates are freshly invented and were never "saved" identity
+    // to preserve), trust its OWN vertices/edges/faces directly, keyed via
+    // keySkeleton, rather than bouncing through fillCubesFromSkeleton and
+    // recomputing via computeBrinkSkeleton(positions) — which re-derives
+    // vertex indices from a lexicographic sort that generally does NOT
+    // reproduce the keys faceColors was saved against (see brinkSkeleton.js's
+    // keySkeleton comment). Only the abstract-realization path has no
+    // trustworthy concrete skeleton to keep, so it alone still recomputes.
+    const after = hasDrawing(state)
+      ? { vertices: state.skeleton.vertices, edges: state.skeleton.edges, faces: state.skeleton.faces, ...keySkeleton(state.skeleton.edges, state.skeleton.faces) }
+      : computeBrinkSkeleton(positions);
     const afterColors = new Map(Object.entries(state.faceColors ?? {}).filter(([k]) => after.byFaceKey.has(k)));
     recordSkeletonEdit(before, after, 'Load', null, beforeColors, afterColors);
     faceColors.clear();
@@ -321,9 +344,14 @@ async function main() {
   // loading a drawn graph *as* abstract, to re-realize its coordinates, is a
   // meaningful thing to ask for.
   //
-  // Whatever the route, the applied `positions` become the in-memory cube
-  // cache backing rendering, picking, and export; the app re-derives the
-  // skeleton from them on load.
+  // The GRAPH is the source of truth, not the cubes: `positions` becomes the
+  // in-memory cube cache backing rendering, picking, and export, but when a
+  // real drawing was loaded, applyLoadedState keeps that drawing's OWN
+  // vertices/edges/faces (and their keys) as `currentSkeleton` rather than
+  // re-deriving a skeleton from the cubes it just filled — see
+  // applyLoadedState and brinkSkeleton.js's keySkeleton. Only the 'abstract'
+  // gesture, which invents coordinates that were never saved identity to
+  // begin with, still recomputes.
   const dropOutOfBounds = (cubes) => {
     const kept = cubes.filter((c) => inBounds(c.x, c.y, c.z));
     if (kept.length !== cubes.length) {
@@ -601,7 +629,15 @@ async function main() {
     }
     faceColors.clear();
     for (const [k, v] of Object.entries(state?.faceColors ?? {})) faceColors.set(k, v);
-    updateBrinkSkeleton(); // prunes faceColors against the freshly derived skeleton
+    // The graph is the source of truth: when a real drawing was restored,
+    // keep ITS OWN vertices/edges/faces (and keys) rather than re-deriving a
+    // skeleton from the cubes just filled — see applyLoadedState's identical
+    // reasoning and brinkSkeleton.js's keySkeleton.
+    const skeleton =
+      state && hasDrawing(state)
+        ? { vertices: state.skeleton.vertices, edges: state.skeleton.edges, faces: state.skeleton.faces, ...keySkeleton(state.skeleton.edges, state.skeleton.faces) }
+        : computeBrinkSkeleton(positions);
+    adoptSkeleton(skeleton); // prunes faceColors against the adopted skeleton
     setMode(restored?.length ? 'graph' : 'cubes');
   }
 
