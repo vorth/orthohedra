@@ -117,6 +117,36 @@ body {
   height: 100px;
 }
 
+#faceContextMenu {
+  position: absolute;
+  z-index: 20;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--outline);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+#faceContextMenu button {
+  display: block;
+  width: 100%;
+  appearance: none;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  padding: 8px 14px;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#faceContextMenu button:hover {
+  background: rgba(158, 180, 255, 0.18);
+}
+
 #status {
   margin: 0;
   color: var(--muted);
