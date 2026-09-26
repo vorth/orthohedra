@@ -117,34 +117,32 @@ body {
   height: 100px;
 }
 
-#faceContextMenu {
-  position: absolute;
-  z-index: 20;
-  padding: 4px;
-  border-radius: 10px;
-  background: var(--panel);
-  border: 1px solid var(--outline);
-  backdrop-filter: blur(8px);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+#recentColors {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  margin-top: 8px;
+  width: 100px;
 }
 
-#faceContextMenu button {
-  display: block;
-  width: 100%;
+.recent-swatch {
   appearance: none;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text);
-  padding: 8px 14px;
-  font-size: 0.85rem;
-  text-align: left;
+  border: 1px solid var(--outline);
+  border-radius: 4px;
+  padding: 0;
+  width: 100%;
+  aspect-ratio: 1;
   cursor: pointer;
-  white-space: nowrap;
 }
 
-#faceContextMenu button:hover {
-  background: rgba(158, 180, 255, 0.18);
+.recent-swatch:hover {
+  border-color: #ffffff;
+}
+
+.recent-swatch.empty {
+  background: #1b2444;
+  cursor: default;
+  opacity: 0.5;
 }
 
 #status {

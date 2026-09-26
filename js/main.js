@@ -1,6 +1,6 @@
 import { computeBrinkSkeleton, keySkeleton, logBrinkSkeleton } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
-import { MIN, MAX, inBounds, FACE_COLORS } from "./constants.js";
+import { MIN, MAX, inBounds } from "./constants.js";
 import {
   inPlaneAxes,
   pointSegDist2,
@@ -27,8 +27,7 @@ const graphBtn = document.getElementById('graphBtn');
 const colorModeBtn = document.getElementById('colorModeBtn');
 const colorPanel = document.getElementById('colorPanel');
 const colorSwatch = document.getElementById('colorSwatch');
-const faceContextMenu = document.getElementById('faceContextMenu');
-const colorLikeThisBtn = document.getElementById('colorLikeThisBtn');
+const recentColorsEl = document.getElementById('recentColors');
 const busyOverlay = document.getElementById('busyOverlay');
 const cancelBusyBtn = document.getElementById('cancelBusyBtn');
 
@@ -186,19 +185,6 @@ async function main() {
       candidates.push({ key: currentSkeleton.faceKeys[faceIdx], segments: projected.segments });
     }
     return pickFaceForSquare(candidates, [u, v], isBoundarySquare);
-  }
-
-  // The color a clicked square is CURRENTLY showing: its face's custom color
-  // if it has one, else the default axis tint — mirrors the same fallback
-  // renderBoundaryCubeFaces uses to paint instances (sceneRenderer.js).
-  function displayedColorForClickedSquare(axis, instanceId) {
-    const faceKeyStr = faceKeyForClickedSquare(axis, instanceId);
-    const custom = faceKeyStr ? faceColors.get(faceKeyStr) : undefined;
-    return custom ?? hexToCssColor(FACE_COLORS[axis]);
-  }
-
-  function hexToCssColor(hex) {
-    return `#${hex.toString(16).padStart(6, '0')}`;
   }
 
   // Whether the unit square at in-plane (u,v) on `axis` at plane `coord` is
@@ -1147,6 +1133,62 @@ async function main() {
     }
   });
 
+  // Recently used colors: a small MRU cache, purely a UI convenience (not
+  // model state, like faceVisibility/camera) — persisted across sessions in
+  // localStorage, separate from the design file itself.
+  const RECENT_COLORS_KEY = 'cubes-editor:recentColors';
+  const RECENT_COLORS_MAX = 15;
+  let recentColors = loadRecentColors();
+
+  function loadRecentColors() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(RECENT_COLORS_KEY));
+      if (Array.isArray(parsed)) return parsed.filter((c) => typeof c === 'string').slice(0, RECENT_COLORS_MAX);
+    } catch {
+      // fall through to empty
+    }
+    return [];
+  }
+
+  function saveRecentColors() {
+    try {
+      localStorage.setItem(RECENT_COLORS_KEY, JSON.stringify(recentColors));
+    } catch {
+      // localStorage unavailable/full: recent colors just won't persist
+    }
+  }
+
+  // Move `color` to the front of the MRU list (adding it if new), and
+  // re-render the grid. Used both when a color is actually applied to a face
+  // and when the user picks an existing recent swatch (itself a reuse).
+  function useRecentColor(color) {
+    recentColors = [color, ...recentColors.filter((c) => c !== color)].slice(0, RECENT_COLORS_MAX);
+    saveRecentColors();
+    renderRecentColors();
+  }
+
+  function renderRecentColors() {
+    recentColorsEl.innerHTML = '';
+    for (let i = 0; i < RECENT_COLORS_MAX; i++) {
+      const color = recentColors[i];
+      const swatch = document.createElement('button');
+      swatch.className = color ? 'recent-swatch' : 'recent-swatch empty';
+      swatch.type = 'button';
+      if (color) {
+        swatch.style.background = color;
+        swatch.title = color;
+        swatch.addEventListener('click', () => {
+          colorSwatch.value = color;
+          useRecentColor(color);
+        });
+      } else {
+        swatch.disabled = true;
+      }
+      recentColorsEl.appendChild(swatch);
+    }
+  }
+  renderRecentColors();
+
   // Color-mode click: resolve the clicked square's enclosing graph face and
   // assign it the current swatch color, as one undoable edit (colors are
   // authored content, like a voxel edit — see the faceColors declaration).
@@ -1160,10 +1202,10 @@ async function main() {
     const after = new Map(faceColors);
     recordSkeletonEdit(currentSkeleton, currentSkeleton, 'Color face', null, before, after);
     view.renderBoundaryCubeFaces(positions, { skeleton: currentSkeleton, faceColors });
+    useRecentColor(colorSwatch.value);
   }
 
   view.domElement.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0) return; // left button only; right-click is the context menu (below)
     downX = event.clientX;
     downY = event.clientY;
     if (realizer.isBusy()) return;
@@ -1191,52 +1233,6 @@ async function main() {
       view.hideHoverOutline();
       event.preventDefault();
     }
-  });
-
-  // Right-click context menu: "Color Like This" (Graph/Graph Coloring only).
-  // Reuses the same square->face resolution as a coloring-mode left-click
-  // (faceKeyForClickedSquare), so the menu targets exactly the face a click
-  // there would paint.
-  let contextMenuTarget = null; // color string to copy, while the menu is open
-
-  function hideFaceContextMenu() {
-    faceContextMenu.hidden = true;
-    contextMenuTarget = null;
-  }
-
-  view.domElement.addEventListener('contextmenu', (event) => {
-    if (!isGraphy(mode) || realizer.isBusy()) return;
-    event.preventDefault();
-    const hit = view.getIntersection(event.clientX, event.clientY)[0];
-    if (!hit || hit.instanceId === undefined || hit.instanceId === null) {
-      hideFaceContextMenu();
-      return;
-    }
-    const axis = view.faceMeshAxis(hit.object);
-    if (axis === -1) {
-      hideFaceContextMenu();
-      return;
-    }
-    contextMenuTarget = displayedColorForClickedSquare(axis, hit.instanceId);
-    faceContextMenu.style.left = `${event.clientX}px`;
-    faceContextMenu.style.top = `${event.clientY}px`;
-    faceContextMenu.hidden = false;
-  });
-
-  colorLikeThisBtn.addEventListener('click', () => {
-    if (contextMenuTarget) {
-      colorSwatch.value = contextMenuTarget;
-      if (mode !== 'graph-coloring') setMode('graph-coloring');
-    }
-    hideFaceContextMenu();
-  });
-
-  // Dismiss on any click elsewhere, or Escape.
-  document.addEventListener('pointerdown', (event) => {
-    if (!faceContextMenu.hidden && !faceContextMenu.contains(event.target)) hideFaceContextMenu();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') hideFaceContextMenu();
   });
 
   view.domElement.addEventListener('pointermove', (event) => {
