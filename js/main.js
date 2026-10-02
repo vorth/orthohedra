@@ -1,4 +1,4 @@
-import { computeBrinkSkeleton, keySkeleton, logBrinkSkeleton } from "./brinkSkeleton.js";
+import { computeBrinkSkeleton, keySkeleton, logBrinkSkeleton, skeletonComponentFromFace } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 import { MIN, MAX, inBounds } from "./constants.js";
 import {
@@ -24,6 +24,7 @@ const statusEl = document.getElementById('status');
 const skeletonStatsEl = document.getElementById('skeletonStats');
 const cubesBtn = document.getElementById('cubesBtn');
 const graphBtn = document.getElementById('graphBtn');
+const moveBtn = document.getElementById('moveBtn');
 const colorModeBtn = document.getElementById('colorModeBtn');
 const colorPanel = document.getElementById('colorPanel');
 const colorSwatch = document.getElementById('colorSwatch');
@@ -54,14 +55,20 @@ async function main() {
   // always applies its visual side effects (button state, skeleton
   // visibility) instead of short-circuiting on an already-equal mode.
   //
-  // Three states, not two independent signals (a mode plus a coloring flag):
-  // 'cubes' | 'graph' | 'graph-coloring'. Graph Coloring is a mode in its own
-  // right, not an overlay atop Graph — every transition (including
+  // Four states, not independent signals (a mode plus a coloring flag):
+  // 'cubes' | 'graph' | 'graph-coloring' | 'move'. Graph Coloring is a mode in
+  // its own right, not an overlay atop Graph — every transition (including
   // graph-coloring -> graph directly, which a separate "coloring" boolean
   // handled inconsistently, since setMode('graph') short-circuited on
   // mode==='graph' already being true and never reached the code that turned
   // coloring off) goes through the SAME setMode(), so there's exactly one
   // place that decides what's visible/clickable for any given state.
+  //
+  // 'move' renders like 'cubes' (filled-cube visuals, no skeleton, no face
+  // colors) — it's a third drag gesture on the same cubes rendering, not a
+  // graph-y mode: grabbing a visible boundary square picks up the connected
+  // component of cubes behind it and slides the whole group along the
+  // grabbed square's own plane.
   let mode = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
   // Both graph-y modes render the skeleton overlay and allow custom colors;
@@ -98,6 +105,9 @@ async function main() {
   let trapped = false;
   // Cubes-mode drag: { cell, dir, facePoint, baseSkeleton, startX, startY, moved }
   let cubesDrag = null;
+  // Move-mode drag: { cubes, axis, inPlaneAxes, facePoint, baseSkeleton,
+  //   startX, startY, moved }
+  let moveDrag = null;
 
   // Identify the ONE brink-skeleton face (in the plane normal to the edit axis,
   // at the grabbed quad's coordinate) whose edges the grabbed quad is nearest.
@@ -453,7 +463,7 @@ async function main() {
   }
 
   function updateStatus() {
-    const label = mode === 'cubes' ? 'Cubes' : 'Graph';
+    const label = mode === 'cubes' ? 'Cubes' : mode === 'move' ? 'Move' : 'Graph';
     statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
   }
 
@@ -642,23 +652,25 @@ async function main() {
     setMode(restored?.length ? 'graph' : 'cubes');
   }
 
-  // nextMode is 'cubes' | 'graph' | 'graph-coloring'. The single source of
-  // truth for what's visible/clickable in each state — every transition,
-  // including graph <-> graph-coloring, goes through here.
+  // nextMode is 'cubes' | 'graph' | 'graph-coloring' | 'move'. The single
+  // source of truth for what's visible/clickable in each state — every
+  // transition, including graph <-> graph-coloring, goes through here.
   function setMode(nextMode) {
     if (mode === nextMode) return;
     cancelGraphDrag(); // abandon any in-flight graph-mode drag
     cancelCubesDrag(); // abandon any in-flight cubes-mode drag
+    cancelMoveDrag(); // abandon any in-flight move-mode drag
     mode = nextMode;
     cubesBtn.classList.toggle('active', mode === 'cubes');
     graphBtn.classList.toggle('active', mode === 'graph');
     colorModeBtn.classList.toggle('active', mode === 'graph-coloring');
+    moveBtn.classList.toggle('active', mode === 'move');
     colorPanel.hidden = mode !== 'graph-coloring';
-    // Skeleton edges/vertices render for both graph-y modes; cubes mode
-    // shows only cube faces, outlined in black instead (see CLAUDE.md's Two
-    // modes note — Gp/Gb are visually distinct).
+    // Skeleton edges/vertices render for both graph-y modes; cubes and move
+    // modes show only cube faces, outlined in black instead (see CLAUDE.md's
+    // Two modes note — Gp/Gb are visually distinct).
     view.setSkeletonVisible(isGraphy(mode));
-    view.setCubeEdgesVisible(mode === 'cubes');
+    view.setCubeEdgesVisible(mode === 'cubes' || mode === 'move');
     view.hideHoverOutline();
     // Custom colors only ever show in a graph-y mode — repaint the boundary
     // faces so switching modes flips them on/off immediately.
@@ -1088,8 +1100,204 @@ async function main() {
     }
   }
 
+  // --- Move-mode drag --------------------------------------------------------
+  // Grab any visible boundary square and drag within its own plane (its two
+  // in-plane axes, not its normal) to slide the WHOLE connected component of
+  // cubes behind that square by integer steps. Unlike the cubes-mode drag
+  // (which recomputes the skeleton on every step via toggleCubeFaces), this
+  // never touches the skeleton mid-drag — only `positions`/`occupied` and the
+  // boundary-face quads are updated per CLAUDE.md's bulk-edit rule. The
+  // skeleton is recomputed once, at commit.
+  //
+  // The moving group is found by walking the brink skeleton, not cube
+  // face-adjacency: the clicked square belongs to exactly one skeleton face
+  // (via faceKeyForClickedSquare's containment rule — right for "which patch
+  // of surface did you grab", unlike connectedFace's nearest-edge rule, which
+  // answers "which EDGE did you grab near"); skeletonComponentFromFace then
+  // walks that face's connected component (faces sharing an edge) into a
+  // standalone sub-skeleton, and fillCubesFromSkeleton's parity solve recovers
+  // exactly the cubes behind that patch — correctly stopping at a pinch point
+  // (two blobs touching at only an edge or vertex), unlike a naive cube
+  // face-adjacency flood fill.
+
+  // Cell keys for the group of cubes a Move drag is carrying, kept as a Set
+  // for O(1) membership tests against collision candidates.
+  function cellKey(x, y, z) {
+    return `${x},${y},${z}`;
+  }
+
+  function startMoveDrag(axis, instanceId) {
+    if (!currentSkeleton) return false;
+    const faceKeyStr = faceKeyForClickedSquare(axis, instanceId);
+    if (!faceKeyStr) return false;
+    const startFaceIdx = currentSkeleton.byFaceKey.get(faceKeyStr);
+    if (startFaceIdx === undefined) return false;
+
+    const component = skeletonComponentFromFace(currentSkeleton, startFaceIdx);
+    let cubes;
+    try {
+      cubes = fillCubesFromSkeleton(component);
+    } catch (error) {
+      console.error('Move drag: could not recover cubes for the grabbed component:', error);
+      return false;
+    }
+    if (cubes.length === 0) return false;
+
+    const cellSet = new Set(cubes.map(({ x, y, z }) => cellKey(x, y, z)));
+    const info = view.boundaryFaceInfo(axis)?.[instanceId];
+    if (!info) return false;
+
+    moveDrag = {
+      cubes: cellSet,
+      axis,
+      inPlaneAxes: inPlaneAxes(axis),
+      facePoint: info.center,
+      baseSkeleton: currentSkeleton,
+      startX: 0,
+      startY: 0,
+      moved: false,
+    };
+    return true;
+  }
+
+  // Attempt to shift every cube in the moving group by one unit along
+  // in-plane axis `shiftAxis`, direction `step` (+1/-1). Refused as a whole
+  // (rigid-body rule) if any moving cube's destination is occupied by a cube
+  // NOT in the moving group. A destination outside the editable region
+  // "eats" that cube instead of blocking the move — it is dropped rather
+  // than relocated. Returns true if the group (or what's left of it) moved.
+  function tryMoveStep(shiftAxis, step) {
+    const { cubes } = moveDrag;
+    const delta = [0, 0, 0];
+    delta[shiftAxis] = step;
+
+    // Refuse to empty the model completely, mirroring canRemoveLastCube —
+    // there must always be something left to grab hold of. Only relevant
+    // when the moving group IS the whole model and this step would walk
+    // every cube in it out of bounds at once.
+    if (cubes.size === positions.length) {
+      let anySurvives = false;
+      for (const k of cubes) {
+        const [x, y, z] = k.split(',').map(Number);
+        if (inBounds(x + delta[0], y + delta[1], z + delta[2])) { anySurvives = true; break; }
+      }
+      if (!anySurvives) return false;
+    }
+
+    // Legality: every destination cell must be either in-bounds-and-free of
+    // OTHER (non-moving) cubes, or itself about to be vacated by the move
+    // (i.e. also in the moving set) — or out of bounds, which eats the cube
+    // rather than blocking anything.
+    for (const k of cubes) {
+      const [x, y, z] = k.split(',').map(Number);
+      const tx = x + delta[0], ty = y + delta[1], tz = z + delta[2];
+      if (!inBounds(tx, ty, tz)) continue; // this cube will be eaten, not blocked
+      const destKey = cellKey(tx, ty, tz);
+      if (cubes.has(destKey)) continue; // destination vacated by another moving cube
+      if (hasVoxel(tx, ty, tz)) return false; // blocked by a stationary cube
+    }
+
+    // Legal: remove every moving cube from its old cell, then re-add (unless
+    // eaten) at its shifted cell. Removing all first avoids a moving cube's
+    // OLD position being mistaken for an obstacle when another moving cube
+    // slides into it this same step.
+    const newCells = [];
+    for (const k of cubes) {
+      const [x, y, z] = k.split(',').map(Number);
+      removeVoxelRaw(x, y, z);
+      const tx = x + delta[0], ty = y + delta[1], tz = z + delta[2];
+      if (inBounds(tx, ty, tz)) newCells.push([tx, ty, tz]);
+    }
+    cubes.clear();
+    for (const [x, y, z] of newCells) {
+      addVoxelRaw(x, y, z);
+      cubes.add(cellKey(x, y, z));
+    }
+
+    moveDrag.moved = true;
+    view.renderBoundaryCubeFaces(positions, isGraphy(mode) ? { skeleton: currentSkeleton, faceColors } : null);
+    return true;
+  }
+
+  function beginMoveDrag(clientX, clientY) {
+    const hit = view.getIntersection(clientX, clientY)[0];
+    if (!hit || hit.instanceId === undefined || hit.instanceId === null) return false;
+    const axis = view.faceMeshAxis(hit.object);
+    if (axis === -1) return false;
+    if (!startMoveDrag(axis, hit.instanceId)) return false;
+    moveDrag.startX = clientX;
+    moveDrag.startY = clientY;
+    view.setControlsEnabled(false);
+    return true;
+  }
+
+  function updateMoveDrag(clientX, clientY) {
+    const dx = clientX - moveDrag.startX;
+    const dy = clientY - moveDrag.startY;
+    const stepPixels = view.dragStepPixels();
+    if (Math.hypot(dx, dy) < stepPixels) return;
+
+    // Which in-plane axis does the on-screen drag track more closely? Compare
+    // the drag vector against each in-plane axis's screen-projected unit
+    // direction and take whichever has the larger (signed) component.
+    const [uAxis, vAxis] = moveDrag.inPlaneAxes;
+    const uDir = [0, 0, 0]; uDir[uAxis] = 1;
+    const vDir = [0, 0, 0]; vDir[vAxis] = 1;
+    const uScreen = view.screenDirection(moveDrag.facePoint, uDir);
+    const vScreen = view.screenDirection(moveDrag.facePoint, vDir);
+    const uAlong = dx * uScreen.x + dy * uScreen.y;
+    const vAlong = dx * vScreen.x + dy * vScreen.y;
+
+    const shiftAxis = Math.abs(uAlong) >= Math.abs(vAlong) ? uAxis : vAxis;
+    const step = (shiftAxis === uAxis ? uAlong : vAlong) >= 0 ? 1 : -1;
+
+    // Re-anchor regardless of outcome so the next step is measured from here.
+    moveDrag.startX = clientX;
+    moveDrag.startY = clientY;
+
+    if (!tryMoveStep(shiftAxis, step)) return; // refused: group stays put
+
+    const [fx, fy, fz] = moveDrag.facePoint;
+    const delta = [0, 0, 0];
+    delta[shiftAxis] = step;
+    moveDrag.facePoint = [fx + delta[0], fy + delta[1], fz + delta[2]];
+  }
+
+  function commitMoveDrag() {
+    const { baseSkeleton, moved } = moveDrag;
+    moveDrag = null;
+    view.setControlsEnabled(true);
+    view.finalizeBoundaryFaces();
+    if (!moved) return; // nothing changed: no recompute, no history entry
+
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(baseSkeleton, after, 'Move cubes');
+    adoptSkeleton(after);
+    updateStatus();
+  }
+
+  // Abandon an in-flight move-mode drag (e.g. on a mode switch), restoring
+  // the pre-gesture cubes without recomputing or recording anything.
+  function cancelMoveDrag() {
+    if (!moveDrag) return;
+    const { baseSkeleton, moved } = moveDrag;
+    moveDrag = null;
+    view.setControlsEnabled(true);
+    if (!moved) return;
+    try {
+      const cubes = dropOutOfBounds(fillCubesFromSkeleton(baseSkeleton));
+      for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
+      for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
+      view.renderBoundaryCubeFaces(positions);
+    } catch (error) {
+      console.error('Move drag: could not restore cubes after cancel:', error);
+      updateBrinkSkeleton(); // cubes may be half-swapped: re-derive from them
+    }
+  }
+
   cubesBtn.addEventListener('click', () => setMode('cubes'));
   graphBtn.addEventListener('click', () => setMode('graph'));
+  moveBtn.addEventListener('click', () => setMode('move'));
   colorModeBtn.addEventListener('click', () => setMode(mode === 'graph-coloring' ? 'graph' : 'graph-coloring'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
@@ -1229,6 +1437,11 @@ async function main() {
           event.preventDefault();
         }
       }
+    } else if (mode === 'move') {
+      if (beginMoveDrag(event.clientX, event.clientY)) {
+        view.hideHoverOutline();
+        event.preventDefault();
+      }
     } else if (startCubesDrag(event.clientX, event.clientY)) {
       view.hideHoverOutline();
       event.preventDefault();
@@ -1242,6 +1455,10 @@ async function main() {
     }
     if (cubesDrag) {
       updateCubesDrag(event.clientX, event.clientY);
+      return;
+    }
+    if (moveDrag) {
+      updateMoveDrag(event.clientX, event.clientY);
       return;
     }
 
@@ -1267,6 +1484,10 @@ async function main() {
     }
     if (cubesDrag) {
       commitCubesDrag();
+      return;
+    }
+    if (moveDrag) {
+      commitMoveDrag();
       return;
     }
     const dist = Math.hypot(event.clientX - downX, event.clientY - downY);

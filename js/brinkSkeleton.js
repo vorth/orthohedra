@@ -278,6 +278,82 @@ export function keySkeleton(edges, faces) {
   return { edgeKeys, faceKeys, byEdgeKey, byFaceKey };
 }
 
+// The connected component of brink-skeleton FACES reachable from
+// `startFaceIdx`, where two faces are adjacent iff they share an edge index.
+// Every skeleton edge belongs to exactly two faces (it sits in the two grid
+// planes perpendicular to the other two axes, each contributing one face
+// cycle — see computeBrinkSkeleton's "Dimension 2" pass), so "shares an
+// edge" is a well-defined, symmetric adjacency between whole faces.
+//
+// Returns a fresh standalone skeleton — {vertices, edges, faces} — holding
+// only the component's own faces, with vertex/edge indices remapped to a
+// dense local range starting at 0. Because a connected set of whole face
+// cycles can never include a "partial" face, every included edge's plane
+// still decomposes into complete cycles exactly as it did in the full
+// skeleton, so this remains a valid brink skeleton in its own right — safe
+// to pass directly to fillCubesFromSkeleton to recover just the cubes behind
+// this one connected patch of surface.
+export function skeletonComponentFromFace(skeleton, startFaceIdx) {
+  const { vertices, edges, faces } = skeleton;
+
+  // Build face adjacency lazily via a shared edge -> [faceIdx, faceIdx] map.
+  const facesByEdge = new Map(); // edgeIdx -> [faceIdx, ...]
+  for (let faceIdx = 0; faceIdx < faces.length; faceIdx++) {
+    for (const edgeIdx of faces[faceIdx]) {
+      if (!facesByEdge.has(edgeIdx)) facesByEdge.set(edgeIdx, []);
+      facesByEdge.get(edgeIdx).push(faceIdx);
+    }
+  }
+
+  const visitedFaces = new Set([startFaceIdx]);
+  const queue = [startFaceIdx];
+  while (queue.length > 0) {
+    const faceIdx = queue.pop();
+    for (const edgeIdx of faces[faceIdx]) {
+      for (const neighborFaceIdx of facesByEdge.get(edgeIdx)) {
+        if (visitedFaces.has(neighborFaceIdx)) continue;
+        visitedFaces.add(neighborFaceIdx);
+        queue.push(neighborFaceIdx);
+      }
+    }
+  }
+
+  // Collect this component's edges and vertices, then remap to dense local
+  // indices so the returned skeleton is self-contained.
+  const localEdgeIdx = new Map(); // global edgeIdx -> local edgeIdx
+  const localVertexIdx = new Map(); // global vertexIdx -> local vertexIdx
+  const outVertices = [];
+  const outEdges = [];
+
+  function remapVertex(globalVi) {
+    let local = localVertexIdx.get(globalVi);
+    if (local === undefined) {
+      local = outVertices.length;
+      localVertexIdx.set(globalVi, local);
+      outVertices.push(vertices[globalVi]);
+    }
+    return local;
+  }
+
+  function remapEdge(globalEi) {
+    let local = localEdgeIdx.get(globalEi);
+    if (local === undefined) {
+      const [v1, v2] = edges[globalEi];
+      local = outEdges.length;
+      localEdgeIdx.set(globalEi, local);
+      outEdges.push([remapVertex(v1), remapVertex(v2)]);
+    }
+    return local;
+  }
+
+  const outFaces = [];
+  for (const faceIdx of visitedFaces) {
+    outFaces.push(faces[faceIdx].map(remapEdge));
+  }
+
+  return { vertices: outVertices, edges: outEdges, faces: outFaces };
+}
+
 export function logBrinkSkeleton(skeleton) {
   console.log('Brink skeleton:', {
     vertices: skeleton.vertices,
