@@ -26,6 +26,7 @@ const cubesBtn = document.getElementById('cubesBtn');
 const graphBtn = document.getElementById('graphBtn');
 const moveBtn = document.getElementById('moveBtn');
 const copyBtn = document.getElementById('copyBtn');
+const rotateBtn = document.getElementById('rotateBtn');
 const colorModeBtn = document.getElementById('colorModeBtn');
 const colorPanel = document.getElementById('colorPanel');
 const colorSwatch = document.getElementById('colorSwatch');
@@ -56,21 +57,23 @@ async function main() {
   // always applies its visual side effects (button state, skeleton
   // visibility) instead of short-circuiting on an already-equal mode.
   //
-  // Five states, not independent signals (a mode plus a coloring flag):
-  // 'cubes' | 'graph' | 'graph-coloring' | 'move' | 'copy'. Graph Coloring is
-  // a mode in its own right, not an overlay atop Graph — every transition
-  // (including graph-coloring -> graph directly, which a separate "coloring"
-  // boolean handled inconsistently, since setMode('graph') short-circuited on
-  // mode==='graph' already being true and never reached the code that turned
-  // coloring off) goes through the SAME setMode(), so there's exactly one
-  // place that decides what's visible/clickable for any given state.
+  // Six states, not independent signals (a mode plus a coloring flag):
+  // 'cubes' | 'graph' | 'graph-coloring' | 'move' | 'copy' | 'rotate'. Graph
+  // Coloring is a mode in its own right, not an overlay atop Graph — every
+  // transition (including graph-coloring -> graph directly, which a separate
+  // "coloring" boolean handled inconsistently, since setMode('graph')
+  // short-circuited on mode==='graph' already being true and never reached
+  // the code that turned coloring off) goes through the SAME setMode(), so
+  // there's exactly one place that decides what's visible/clickable for any
+  // given state.
   //
-  // 'move' and 'copy' render like 'cubes' (filled-cube visuals, no skeleton,
-  // no face colors) — they're drag gestures on the same cubes rendering, not
-  // graph-y modes: grabbing a visible boundary square picks up the connected
-  // component of cubes behind it, then either slides the whole group within
-  // the grabbed square's own plane (Move) or stamps down an offset duplicate
-  // of it (Copy).
+  // 'move', 'copy', and 'rotate' render like 'cubes' (filled-cube visuals, no
+  // skeleton, no face colors) — they're gestures on the same cubes
+  // rendering, not graph-y modes: grabbing or clicking a visible boundary
+  // square picks up the connected component of cubes behind it, then either
+  // slides the whole group within the grabbed square's own plane (Move),
+  // stamps down an offset duplicate of it (Copy), or spins it 90 degrees in
+  // the clicked square's plane (Rotate).
   let mode = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
   // Both graph-y modes render the skeleton overlay and allow custom colors;
@@ -468,7 +471,12 @@ async function main() {
   }
 
   function updateStatus() {
-    const label = mode === 'cubes' ? 'Cubes' : mode === 'move' ? 'Move' : mode === 'copy' ? 'Copy' : 'Graph';
+    const label =
+      mode === 'cubes' ? 'Cubes' :
+      mode === 'move' ? 'Move' :
+      mode === 'copy' ? 'Copy' :
+      mode === 'rotate' ? 'Rotate' :
+      'Graph';
     statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
   }
 
@@ -657,9 +665,10 @@ async function main() {
     setMode(restored?.length ? 'graph' : 'cubes');
   }
 
-  // nextMode is 'cubes' | 'graph' | 'graph-coloring' | 'move' | 'copy'. The
-  // single source of truth for what's visible/clickable in each state —
-  // every transition, including graph <-> graph-coloring, goes through here.
+  // nextMode is 'cubes' | 'graph' | 'graph-coloring' | 'move' | 'copy' |
+  // 'rotate'. The single source of truth for what's visible/clickable in
+  // each state — every transition, including graph <-> graph-coloring,
+  // goes through here.
   function setMode(nextMode) {
     if (mode === nextMode) return;
     cancelGraphDrag(); // abandon any in-flight graph-mode drag
@@ -672,12 +681,13 @@ async function main() {
     colorModeBtn.classList.toggle('active', mode === 'graph-coloring');
     moveBtn.classList.toggle('active', mode === 'move');
     copyBtn.classList.toggle('active', mode === 'copy');
+    rotateBtn.classList.toggle('active', mode === 'rotate');
     colorPanel.hidden = mode !== 'graph-coloring';
-    // Skeleton edges/vertices render for both graph-y modes; cubes, move, and
-    // copy modes show only cube faces, outlined in black instead (see
-    // CLAUDE.md's Two modes note — Gp/Gb are visually distinct).
+    // Skeleton edges/vertices render for both graph-y modes; cubes, move,
+    // copy, and rotate modes show only cube faces, outlined in black instead
+    // (see CLAUDE.md's Two modes note — Gp/Gb are visually distinct).
     view.setSkeletonVisible(isGraphy(mode));
-    view.setCubeEdgesVisible(mode === 'cubes' || mode === 'move' || mode === 'copy');
+    view.setCubeEdgesVisible(mode === 'cubes' || mode === 'move' || mode === 'copy' || mode === 'rotate');
     view.hideHoverOutline();
     // Custom colors only ever show in a graph-y mode — repaint the boundary
     // faces so switching modes flips them on/off immediately.
@@ -1463,10 +1473,102 @@ async function main() {
     if (hadPreview) view.renderBoundaryCubeFaces(positions, isGraphy(mode) ? { skeleton: currentSkeleton, faceColors } : null);
   }
 
+  // --- Rotate mode -----------------------------------------------------
+  // Click (not drag) any visible boundary square to spin the connected
+  // component behind it 90 degrees, in place, within that square's own
+  // plane. Always turns the same way (counterclockwise as seen from outside
+  // the clicked face, i.e. looking against its outward normal). Unlike
+  // Move/Copy there's no live preview or in-flight state to cancel — a
+  // click either succeeds outright (one undo entry) or fails silently (the
+  // rotated shape would touch a foreign cube), with nothing in between.
+
+  // Rotate (x,y,z) 90 degrees CCW (viewed against the +axis direction,
+  // i.e. looking from +axis toward the origin) around in-plane pivot
+  // (pu, pv), both integers. Works in cube CENTERS (least corner + 0.5 on
+  // each axis) so the quarter-turn always lands back on integers, then
+  // converts back to a least corner.
+  function rotateCellCCW(x, y, z, axis, pu, pv) {
+    const [ua, va] = inPlaneAxes(axis);
+    const cell = [x, y, z];
+    const cu = cell[ua] + 0.5 - pu;
+    const cv = cell[va] + 0.5 - pv;
+    cell[ua] = -cv + pu - 0.5;
+    cell[va] = cu + pv - 0.5;
+    return cell;
+  }
+
+  // Do any of `rotatedCubes` touch (share a face, edge, or vertex with) a
+  // cube NOT in `componentCells`? Checks the full 3x3x3 neighborhood of
+  // every rotated cube against `occupied` — the component's OWN original
+  // cells are still occupied at this point (nothing has been removed yet),
+  // so they're explicitly excluded via `componentCells` rather than read
+  // back from the (soon-to-be-stale) voxel set.
+  function rotatedShapeTouchesForeignCube(rotatedCubes, componentCells) {
+    for (const [x, y, z] of rotatedCubes) {
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dz = -1; dz <= 1; dz++) {
+            const nx = x + dx, ny = y + dy, nz = z + dz;
+            if (!hasVoxel(nx, ny, nz)) continue;
+            if (componentCells.has(cellKey(nx, ny, nz))) continue; // part of the moving component itself
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function rotateClickedComponent(axis, instanceId) {
+    const grabbed = findGrabbedComponent(axis, instanceId);
+    if (!grabbed) return;
+    const { cellSet } = grabbed;
+    const [ua, va] = inPlaneAxes(axis);
+
+    // Pivot: the component's own in-plane bounding-box center, rounded to
+    // the nearest integer lattice line (fine either way when the true
+    // center falls on a half-integer — any integer within <1 unit works).
+    let loU = Infinity, hiU = -Infinity, loV = Infinity, hiV = -Infinity;
+    for (const k of cellSet) {
+      const [x, y, z] = k.split(',').map(Number);
+      const cell = [x, y, z];
+      if (cell[ua] < loU) loU = cell[ua];
+      if (cell[ua] > hiU) hiU = cell[ua];
+      if (cell[va] < loV) loV = cell[va];
+      if (cell[va] > hiV) hiV = cell[va];
+    }
+    // +0.5 to pivot on cube CENTERS, not least corners, before rounding.
+    const pu = Math.round((loU + hiU) / 2 + 0.5);
+    const pv = Math.round((loV + hiV) / 2 + 0.5);
+
+    const rotatedCubes = [];
+    for (const k of cellSet) {
+      const [x, y, z] = k.split(',').map(Number);
+      rotatedCubes.push(rotateCellCCW(x, y, z, axis, pu, pv));
+    }
+
+    if (rotatedShapeTouchesForeignCube(rotatedCubes, cellSet)) return; // fail quietly
+
+    const before = currentSkeleton;
+    for (const k of cellSet) {
+      const [x, y, z] = k.split(',').map(Number);
+      removeVoxelRaw(x, y, z);
+    }
+    for (const [x, y, z] of rotatedCubes) {
+      if (inBounds(x, y, z)) addVoxelRaw(x, y, z); // out-of-bounds: eaten by the wall
+    }
+
+    const after = computeBrinkSkeleton(positions);
+    recordSkeletonEdit(before, after, 'Rotate cubes');
+    adoptSkeleton(after);
+    updateStatus();
+  }
+
   cubesBtn.addEventListener('click', () => setMode('cubes'));
   graphBtn.addEventListener('click', () => setMode('graph'));
   moveBtn.addEventListener('click', () => setMode('move'));
   copyBtn.addEventListener('click', () => setMode('copy'));
+  rotateBtn.addEventListener('click', () => setMode('rotate'));
   colorModeBtn.addEventListener('click', () => setMode(mode === 'graph-coloring' ? 'graph' : 'graph-coloring'));
   cancelBusyBtn.addEventListener('click', () => cancelRealization());
 
@@ -1615,6 +1717,19 @@ async function main() {
       if (beginCopyDrag(event.clientX, event.clientY)) {
         view.hideHoverOutline();
         event.preventDefault();
+      }
+    } else if (mode === 'rotate') {
+      // A click, not a drag: resolve and apply immediately on pointerdown.
+      // Still needs preventDefault so the trackball doesn't also start
+      // rotating the camera from the same gesture.
+      const hit = view.getIntersection(event.clientX, event.clientY)[0];
+      if (hit && hit.instanceId !== undefined && hit.instanceId !== null) {
+        const axis = view.faceMeshAxis(hit.object);
+        if (axis !== -1) {
+          rotateClickedComponent(axis, hit.instanceId);
+          view.hideHoverOutline();
+          event.preventDefault();
+        }
       }
     } else if (startCubesDrag(event.clientX, event.clientY)) {
       view.hideHoverOutline();
