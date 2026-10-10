@@ -30,11 +30,14 @@
         <input type="color" id="colorSwatch" value="#ff00aa">
         <div id="recentColors"></div>
       </div>
-    </div>
-
-    <div slot="info">
-      <p id="status">Mode: Cubes<br>Cubes: 1</p>
-      <p id="skeletonStats"></p>
+      <details id="metricsPanel" open>
+        <summary>Metrics</summary>
+        <div class="metrics-body">
+          <table id="skeletonStats">
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
     </div>
   </design-app>
 

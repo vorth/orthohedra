@@ -1,4 +1,4 @@
-import { computeBrinkSkeleton, keySkeleton, logBrinkSkeleton, skeletonComponentFromFace } from "./brinkSkeleton.js";
+import { computeBrinkSkeleton, computeBoundaryCubeFaces, keySkeleton, logBrinkSkeleton, skeletonComponentFromFace, skeletonComponents } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 import { MIN, MAX, inBounds } from "./constants.js";
 import {
@@ -20,8 +20,7 @@ import { createSceneRenderer } from "./sceneRenderer.js";
 
 const app = document.querySelector('design-app');
 const errorEl = document.getElementById('error');
-const statusEl = document.getElementById('status');
-const skeletonStatsEl = document.getElementById('skeletonStats');
+const skeletonStatsBodyEl = document.querySelector('#skeletonStats tbody');
 const cubesBtn = document.getElementById('cubesBtn');
 const graphBtn = document.getElementById('graphBtn');
 const moveBtn = document.getElementById('moveBtn');
@@ -470,14 +469,10 @@ async function main() {
     return occupied.has(key(x, y, z));
   }
 
+  // The cube count lives in the metrics table, so refreshing it means
+  // re-rendering that table against the current skeleton.
   function updateStatus() {
-    const label =
-      mode === 'cubes' ? 'Cubes' :
-      mode === 'move' ? 'Move' :
-      mode === 'copy' ? 'Copy' :
-      mode === 'rotate' ? 'Rotate' :
-      'Graph';
-    statusEl.innerHTML = `Mode: ${label}<br>Cubes: ${positions.length}`;
+    if (currentSkeleton) renderSkeletonStats(currentSkeleton);
   }
 
   // A graph is bipartite iff it has no odd-length cycle. 2-color each
@@ -509,6 +504,82 @@ async function main() {
     return true;
   }
 
+  // Name a face by its edge count. Brink-skeleton face cycles are always even
+  // (each face is a cycle in a grid plane), and there is no upper bound on how
+  // large they get, so only the few conventional names are spelled out and
+  // everything above falls back to "N-gon".
+  const FACE_TYPE_NAMES = new Map([
+    [4, 'Rectangles'],
+    [6, 'Hexagons'],
+    [8, 'Octagons'],
+    [10, 'Decagons'],
+  ]);
+
+  function faceTypeName(edgeCount) {
+    return FACE_TYPE_NAMES.get(edgeCount) ?? `${edgeCount}-gons`;
+  }
+
+  // A breakdown row per face type PRESENT in the design, in increasing edge
+  // count. A type is listed if any component has it; components lacking it
+  // show 0, so every row stays aligned across the columns.
+  function faceTypeRows(components, row) {
+    const counts = components.map((c) => {
+      const byType = new Map();
+      for (const face of c.faces) {
+        byType.set(face.length, (byType.get(face.length) ?? 0) + 1);
+      }
+      return byType;
+    });
+    const present = new Set();
+    for (const byType of counts) {
+      for (const edgeCount of byType.keys()) present.add(edgeCount);
+    }
+    return [...present]
+      .sort((a, b) => a - b)
+      .map((edgeCount) =>
+        row(faceTypeName(edgeCount), (c, i) => counts[i].get(edgeCount) ?? 0, 'metric-sub'),
+      );
+  }
+
+  // Per-component topology readout for the Metrics panel. Each connected
+  // component of the skeleton is measured on its own — Euler characteristic
+  // and orientability are per-surface properties, so summing them over a
+  // multi-component skeleton would be meaningless. Components are
+  // deliberately unlabeled: they can overlap in space (the boundary of a
+  // one-cube-thick annular slab is an outer and an inner surface sharing the
+  // same top and bottom planes), so no name, index, or bounding box would
+  // tell the user which column is which piece on screen.
+  function renderSkeletonStats(skeleton) {
+    const components = skeletonComponents(skeleton);
+    if (components.length === 0) {
+      skeletonStatsBodyEl.innerHTML = '';
+      return;
+    }
+    // Transposed layout: one row per metric, one column per component, so the
+    // metric labels read down the left edge.
+    const row = (label, cell, className = '') =>
+      `<tr${className ? ` class="${className}"` : ''}><th scope="row">${label}</th>` +
+      components.map((c, i) => `<td>${cell(c, i)}</td>`).join('') +
+      '</tr>';
+    // Cubes and Squares are the GLOBAL figures: components can overlap in
+    // space, so measuring each one separately double-counts (the
+    // 3x3-minus-center slab fills to 9 + 1 cubes for its 8 actual cubes).
+    // Each gets one spanning cell instead of a per-component column.
+    const spanningRow = (label, value) =>
+      `<tr class="metric-span"><th scope="row">${label}</th>` +
+      `<td colspan="${components.length}">${value}</td></tr>`;
+    skeletonStatsBodyEl.innerHTML = [
+      spanningRow('Cubes', positions.length),
+      spanningRow('Squares', computeBoundaryCubeFaces(positions).length),
+      row('Vertices', (c) => c.vertices.length),
+      row('Edges', (c) => c.edges.length),
+      row('Faces', (c) => c.faces.length),
+      ...faceTypeRows(components, row),
+      row('Euler χ', (c) => c.vertices.length - c.edges.length + c.faces.length),
+      row('Orientable', (c) => (isBipartite(c.vertices.length, c.edges) ? 'yes' : 'no')),
+    ].join('');
+  }
+
   // Adopt an ALREADY-KNOWN skeleton as the current one: render it, restate the
   // topology readout, and rebuild the cube-face geometry. Deliberately does NOT
   // derive the graph — a graph-preserving edit already holds the graph, and
@@ -521,13 +592,7 @@ async function main() {
     pruneFaceColors(skeleton);
     // logBrinkSkeleton(skeleton);
     view.renderBrinkSkeleton(skeleton);
-    const V = skeleton.vertices.length;
-    const E = skeleton.edges.length;
-    const F = skeleton.faces.length;
-    const bipartite = isBipartite(V, skeleton.edges);
-    skeletonStatsEl.innerHTML =
-      `Skeleton: V ${V}, E ${E}, F ${F}<br>Euler χ: ${V - E + F}<br>` +
-      `Orientable: ${bipartite ? 'yes' : 'no'}`;
+    renderSkeletonStats(skeleton);
     // Custom colors are a graph-y-mode-only concept; pass them only when the
     // mode has actually settled into one (during startup, mode is still
     // null on the very first adoptSkeleton call, which is fine — nothing has

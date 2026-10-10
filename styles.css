@@ -145,11 +145,109 @@ body {
   opacity: 0.5;
 }
 
-#status {
-  margin: 0;
+/* Metrics panel: a collapsible readout overlaying the canvas, lower left.
+   Uses <details> so the open/closed state needs no JS. */
+#metricsPanel {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 10;
+  width: 220px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--outline);
+  backdrop-filter: blur(8px);
+  user-select: none;
+  overflow: hidden;
+}
+
+#metricsPanel > summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Replace the default marker with our own triangle so it can be colored and
+   animated to match the panel. */
+#metricsPanel > summary::-webkit-details-marker {
+  display: none;
+}
+
+#metricsPanel > summary::before {
+  content: "";
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.15s ease;
+}
+
+#metricsPanel[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.metrics-body {
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--outline);
+}
+
+/* One row per metric, one column per connected component. Columns are
+   unlabeled by design — see renderSkeletonStats in main.js. */
+#skeletonStats {
+  border-collapse: collapse;
   color: var(--muted);
   font-size: 0.82rem;
-  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Metric labels: the left-hand column. */
+#skeletonStats th[scope="row"] {
+  text-align: left;
+  font-weight: 400;
+  white-space: nowrap;
+  padding: 2px 8px 2px 0;
+}
+
+#skeletonStats td {
+  text-align: right;
+  color: var(--text);
+  padding: 2px 0 2px 8px;
+}
+
+/* Cubes and Squares are whole-design totals spanning every component column.
+   A rule goes under the LAST of them — i.e. the one not followed by another
+   spanning row — to separate the globals from the per-component rows below. */
+#skeletonStats .metric-span:not(:has(+ .metric-span)) th,
+#skeletonStats .metric-span:not(:has(+ .metric-span)) td {
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--outline);
+}
+
+#skeletonStats .metric-span + tr:not(.metric-span) th,
+#skeletonStats .metric-span + tr:not(.metric-span) td {
+  padding-top: 4px;
+}
+
+/* Face-type breakdown: indented under the Faces row that totals them. */
+#skeletonStats .metric-sub th[scope="row"] {
+  padding-left: 10px;
+  font-size: 0.95em;
+  opacity: 0.8;
+}
+
+/* An empty design has no components and so no rows; collapse the panel body
+   rather than leaving an empty table behind. */
+#skeletonStats:not(:has(tbody tr)) {
+  display: none;
 }
 
 #error {

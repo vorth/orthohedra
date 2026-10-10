@@ -7,11 +7,6 @@
   - face counts by size
   - count of singular points
 - count of unit squares
-- modes
-  - cubes
-  - graph
-  - move
-- custom face coloring
 - custom default colors
 
 ## nice to have

@@ -278,33 +278,22 @@ export function keySkeleton(edges, faces) {
   return { edgeKeys, faceKeys, byEdgeKey, byFaceKey };
 }
 
-// The connected component of brink-skeleton FACES reachable from
-// `startFaceIdx`, where two faces are adjacent iff they share an edge index.
-// Every skeleton edge belongs to exactly two faces (it sits in the two grid
-// planes perpendicular to the other two axes, each contributing one face
-// cycle — see computeBrinkSkeleton's "Dimension 2" pass), so "shares an
-// edge" is a well-defined, symmetric adjacency between whole faces.
-//
-// Returns a fresh standalone skeleton — {vertices, edges, faces} — holding
-// only the component's own faces, with vertex/edge indices remapped to a
-// dense local range starting at 0. Because a connected set of whole face
-// cycles can never include a "partial" face, every included edge's plane
-// still decomposes into complete cycles exactly as it did in the full
-// skeleton, so this remains a valid brink skeleton in its own right — safe
-// to pass directly to fillCubesFromSkeleton to recover just the cubes behind
-// this one connected patch of surface.
-export function skeletonComponentFromFace(skeleton, startFaceIdx) {
-  const { vertices, edges, faces } = skeleton;
-
-  // Build face adjacency lazily via a shared edge -> [faceIdx, faceIdx] map.
-  const facesByEdge = new Map(); // edgeIdx -> [faceIdx, ...]
+// edgeIdx -> [faceIdx, ...]: the share-an-edge face adjacency, built once and
+// reusable across many component walks over the same skeleton.
+function buildFacesByEdge(faces) {
+  const facesByEdge = new Map();
   for (let faceIdx = 0; faceIdx < faces.length; faceIdx++) {
     for (const edgeIdx of faces[faceIdx]) {
       if (!facesByEdge.has(edgeIdx)) facesByEdge.set(edgeIdx, []);
       facesByEdge.get(edgeIdx).push(faceIdx);
     }
   }
+  return facesByEdge;
+}
 
+// Flood-fill the face adjacency from `startFaceIdx`, returning the set of
+// GLOBAL face indices in that component.
+function walkComponentFaces(faces, facesByEdge, startFaceIdx) {
   const visitedFaces = new Set([startFaceIdx]);
   const queue = [startFaceIdx];
   while (queue.length > 0) {
@@ -317,6 +306,14 @@ export function skeletonComponentFromFace(skeleton, startFaceIdx) {
       }
     }
   }
+  return visitedFaces;
+}
+
+// Repackage a set of global face indices as a standalone skeleton, remapping
+// vertex/edge indices into a dense local range starting at 0.
+function skeletonFromFaceSet(skeleton, faceIndices) {
+  const { vertices, edges, faces } = skeleton;
+  const visitedFaces = faceIndices;
 
   // Collect this component's edges and vertices, then remap to dense local
   // indices so the returned skeleton is self-contained.
@@ -352,6 +349,54 @@ export function skeletonComponentFromFace(skeleton, startFaceIdx) {
   }
 
   return { vertices: outVertices, edges: outEdges, faces: outFaces };
+}
+
+// The connected component of brink-skeleton FACES reachable from
+// `startFaceIdx`, where two faces are adjacent iff they share an edge index.
+// Every skeleton edge belongs to exactly two faces (it sits in the two grid
+// planes perpendicular to the other two axes, each contributing one face
+// cycle — see computeBrinkSkeleton's "Dimension 2" pass), so "shares an
+// edge" is a well-defined, symmetric adjacency between whole faces.
+//
+// Returns a fresh standalone skeleton — {vertices, edges, faces} — holding
+// only the component's own faces, with vertex/edge indices remapped to a
+// dense local range starting at 0. Because a connected set of whole face
+// cycles can never include a "partial" face, every included edge's plane
+// still decomposes into complete cycles exactly as it did in the full
+// skeleton, so this remains a valid brink skeleton in its own right — safe
+// to pass directly to fillCubesFromSkeleton to recover just the cubes behind
+// this one connected patch of surface.
+export function skeletonComponentFromFace(skeleton, startFaceIdx) {
+  const facesByEdge = buildFacesByEdge(skeleton.faces);
+  const faceSet = walkComponentFaces(skeleton.faces, facesByEdge, startFaceIdx);
+  return skeletonFromFaceSet(skeleton, faceSet);
+}
+
+// Partition a skeleton into its connected components, using the same
+// share-an-edge face adjacency as skeletonComponentFromFace. Returns an array
+// of standalone skeletons, one per component, each with its own dense
+// vertex/edge indices — so every component can be measured (or filled)
+// exactly as if it were the whole skeleton.
+//
+// Components come out in order of their lowest-numbered face, which makes the
+// ordering stable across recomputation for an unchanged design: face indices
+// derive from the sorted grid traversal in computeBrinkSkeleton, not from any
+// traversal order here.
+export function skeletonComponents(skeleton) {
+  const { faces } = skeleton;
+  const facesByEdge = buildFacesByEdge(faces);
+
+  // Faces already claimed by an earlier component, so each component is
+  // walked exactly once no matter how many faces it has.
+  const seen = new Set();
+  const components = [];
+  for (let faceIdx = 0; faceIdx < faces.length; faceIdx++) {
+    if (seen.has(faceIdx)) continue;
+    const faceSet = walkComponentFaces(faces, facesByEdge, faceIdx);
+    for (const globalFaceIdx of faceSet) seen.add(globalFaceIdx);
+    components.push(skeletonFromFaceSet(skeleton, faceSet));
+  }
+  return components;
 }
 
 export function logBrinkSkeleton(skeleton) {
