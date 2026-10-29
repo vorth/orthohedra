@@ -41,7 +41,7 @@ const INITIAL_INSTANCES = 4096;
 
 export function createSceneRenderer(app) {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1a1a);
+  scene.background = new THREE.Color(0x686868);
 
   const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 300);
   camera.position.set(3.2, 2.3, 3.2);
@@ -109,7 +109,7 @@ export function createSceneRenderer(app) {
   // 6 material groups in order +X,-X,+Y,-Y,+Z,-Z; we pair opposite faces onto
   // one material per axis so a ray hit's materialIndex maps straight to the
   // axis (materialIndex >> 1).
-  const boundsHelper = new THREE.Box3Helper(bounds, 0x3e4f8c);
+  const boundsHelper = new THREE.Box3Helper(bounds, 0xffffff);
   scene.add(boundsHelper);
 
   const boundsCenter = new THREE.Vector3();
@@ -640,6 +640,26 @@ export function createSceneRenderer(app) {
   const skeletonVertexHolder = [makeInstancedMesh(skeletonVertexGeometry, skeletonVertexMaterial, INITIAL_INSTANCES)];
   scene.add(skeletonVertexHolder[0]);
 
+  // Crossing defects (edge crossings, edge-through-face points — see
+  // brinkSkeleton.js's computeCrossingDefects): dark charcoal spheres 50% larger
+  // than the vertex spheres. They belong to the graph view, so they show and
+  // hide with the skeleton.
+  const crossingDefectGeometry = new THREE.SphereGeometry(SKELETON_VERTEX_RADIUS * 1.5, 12, 8);
+  const crossingDefectMaterial = new THREE.MeshStandardMaterial({ color: 0x2b2b2b, roughness: 0.5 });
+  const crossingDefectHolder = [makeInstancedMesh(crossingDefectGeometry, crossingDefectMaterial, INITIAL_INSTANCES)];
+  scene.add(crossingDefectHolder[0]);
+
+  function renderCrossingDefects(points) {
+    const mesh = ensureInstanceCapacity(crossingDefectHolder, 0, points.length);
+    mesh.count = points.length;
+    for (let i = 0; i < points.length; i++) {
+      const [x, y, z] = points[i];
+      skeletonTempMatrix.makeTranslation(x, y, z);
+      mesh.setMatrixAt(i, skeletonTempMatrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+
   // Impeding-vertex highlight: during a move-mode drag, the barrier vertices
   // that block the drag (the collinear neighbors a dragged vertex must not
   // pass) are marked with a slightly larger red-emissive sphere, drawn over
@@ -760,12 +780,13 @@ export function createSceneRenderer(app) {
     }
   }
 
-  // Show/hide the skeleton meshes (vertices + edges) wholesale, e.g. for Cubes
+  // Show/hide the skeleton meshes (vertices + edges + crossing defects) wholesale, e.g. for Cubes
   // mode, which shows only cube faces. `ensureInstanceCapacity` carries
   // `.visible` across a grown replacement mesh, so this holds even if the
   // skeleton grows while hidden.
   function setSkeletonVisible(visible) {
     skeletonVertexHolder[0].visible = visible;
+    crossingDefectHolder[0].visible = visible;
     for (const mesh of skeletonEdgeMeshes) mesh.visible = visible;
   }
 
@@ -957,6 +978,7 @@ export function createSceneRenderer(app) {
     // model -> pixels
     renderBoundaryCubeFaces,
     renderBrinkSkeleton,
+    renderCrossingDefects,
     setSkeletonVisible,
     setCubeEdgesVisible,
     toggleCubeFaces,

@@ -1,4 +1,4 @@
-import { computeBrinkSkeleton, computeBoundaryCubeFaces, keySkeleton, logBrinkSkeleton, skeletonComponentFromFace, skeletonComponents } from "./brinkSkeleton.js";
+import { computeBrinkSkeleton, computeBoundaryCubeFaces, computeCrossingDefects, keySkeleton, logBrinkSkeleton, skeletonComponentFromFace, skeletonComponents } from "./brinkSkeleton.js";
 import { fillCubesFromSkeleton } from "./realizeSkeleton.js";
 import { MIN, MAX, inBounds } from "./constants.js";
 import {
@@ -75,6 +75,7 @@ async function main() {
   // the clicked square's plane (Rotate).
   let mode = null;
   let currentSkeleton = null; // cached { vertices, edges, faces } from updateBrinkSkeleton
+  let currentCrossingDefects = []; // crossing-defect points of `positions`, refreshed with currentSkeleton
   // Both graph-y modes render the skeleton overlay and allow custom colors;
   // only 'graph-coloring' also enables the color-click interaction.
   const isGraphy = (m) => m === 'graph' || m === 'graph-coloring';
@@ -571,6 +572,7 @@ async function main() {
     skeletonStatsBodyEl.innerHTML = [
       spanningRow('Cubes', positions.length),
       spanningRow('Squares', computeBoundaryCubeFaces(positions).length),
+      spanningRow('Crossing defects', currentCrossingDefects.length),
       row('Vertices', (c) => c.vertices.length),
       row('Edges', (c) => c.edges.length),
       row('Faces', (c) => c.faces.length),
@@ -592,6 +594,10 @@ async function main() {
     pruneFaceColors(skeleton);
     // logBrinkSkeleton(skeleton);
     view.renderBrinkSkeleton(skeleton);
+    // Like Squares, a global figure from the cubes (a crossing can involve
+    // two components), computed once here rather than per stats render.
+    currentCrossingDefects = computeCrossingDefects(positions);
+    view.renderCrossingDefects(currentCrossingDefects);
     renderSkeletonStats(skeleton);
     // Custom colors are a graph-y-mode-only concept; pass them only when the
     // mode has actually settled into one (during startup, mode is still
@@ -959,6 +965,7 @@ async function main() {
     for (const { x, y, z } of [...positions]) removeVoxelRaw(x, y, z);
     for (const { x, y, z } of cubes) addVoxelRaw(x, y, z);
     view.renderBrinkSkeleton(drag.skeleton);
+    view.renderCrossingDefects(computeCrossingDefects(positions));
     // The drag's own live skeleton, not currentSkeleton (stale until
     // commit) — faceKeys are carried forward by reference through a
     // graph-preserving drag (see faceGeometry.js's applySwapStep), so

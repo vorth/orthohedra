@@ -100,6 +100,109 @@ export function computeBoundaryCubeFaces(cubes) {
   return boundaryFaces;
 }
 
+// --- Crossing defects. --------------------------------------------------
+// A crossing defect is a lattice point where the surface is not locally a
+// disk: two (or three) skeleton edges cross there, or an edge passes through
+// the interior of a face. Like everything else here it is a parity rule over
+// the (up to 8) cubes touching the point, so it is decided by a table over
+// the 256 possible configurations.
+//
+// For a point that is NOT a vertex (even cube count), the unit segments on
+// both sides of it along an axis have the same parity, and one is part of a
+// skeleton edge iff an odd number of its 4 surrounding cubes are solid — so
+// each axis has one bit saying "an edge passes straight through here".
+// Likewise a unit square in a plane is a boundary square iff exactly one of
+// its 2 cubes is solid. Then:
+//   - edges through the point along 2 or 3 axes: an edge crossing (a triple
+//     crossing counts once);
+//   - an edge along exactly one axis c, with all 4 squares around the point
+//     in the plane perpendicular to c being boundary squares: the edge
+//     pierces a face.
+// Faces overlapping within one plane cancel by parity, so an edge through a
+// doubly-covered region is deliberately NOT detected.
+//
+// Configuration bit layout: the cube touching point p with least corner
+// p - 1 + (dx,dy,dz), for dx,dy,dz in {0,1}, is bit dx*4 + dy*2 + dz.
+function cornerBit(config, d) {
+  return (config >> (d[0] * 4 + d[1] * 2 + d[2])) & 1;
+}
+
+function isCrossingDefectConfig(config) {
+  let parity = 0;
+  for (const d of CORNER_OFFSETS) parity ^= cornerBit(config, d);
+  if (parity) return false; // odd count: a skeleton vertex
+
+  // Edge through the point along each axis: parity of the 4 cubes on the +
+  // side of the point along that axis.
+  const edgeAxes = AXES.filter((axis) => {
+    let p = 0;
+    for (const d of CORNER_OFFSETS) if (d[axis] === 1) p ^= cornerBit(config, d);
+    return p === 1;
+  });
+  if (edgeAxes.length >= 2) return true; // edge crossing (or triple crossing)
+  if (edgeAxes.length === 0) return false;
+
+  // One edge, along `axis`: it pierces a face iff every column of 2 cubes
+  // along `axis` has exactly one solid, i.e. all 4 squares around the point
+  // in the perpendicular plane are boundary squares.
+  const axis = edgeAxes[0];
+  return CORNER_OFFSETS.filter((d) => d[axis] === 0).every((d) => {
+    const other = [...d];
+    other[axis] = 1;
+    return (cornerBit(config, d) ^ cornerBit(config, other)) === 1;
+  });
+}
+
+const CROSSING_DEFECT_CONFIG = Uint8Array.from({ length: 256 }, (_, config) => (isCrossingDefectConfig(config) ? 1 : 0));
+
+/**
+ * Find the crossing defects of a cube assembly (see above).
+ * @param {Array<{x:number,y:number,z:number}>} cubes - integer least corners
+ * @returns {Array<[number,number,number]>} defect lattice points
+ */
+export function computeCrossingDefects(cubes) {
+  if (cubes.length === 0) return [];
+
+  // Dense grid over the cubes' bounding box padded by one cube on each side,
+  // so every corner point's 8 touching cells are in range. Only corners of
+  // solid cubes can be defects, so visit just those, once each.
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (const { x, y, z } of cubes) {
+    const c = [x, y, z];
+    for (const k of AXES) {
+      if (c[k] < lo[k]) lo[k] = c[k];
+      if (c[k] > hi[k]) hi[k] = c[k];
+    }
+  }
+  const origin = lo.map((v) => v - 1);
+  const size = AXES.map((k) => hi[k] - lo[k] + 3);
+  const idx = (x, y, z) => ((x - origin[0]) * size[1] + (y - origin[1])) * size[2] + (z - origin[2]);
+  const solid = new Uint8Array(size[0] * size[1] * size[2]);
+  for (const { x, y, z } of cubes) solid[idx(x, y, z)] = 1;
+
+  const seen = new Uint8Array(solid.length); // indexed by corner point
+  const defects = [];
+  for (const { x, y, z } of cubes) {
+    for (const o of CORNER_OFFSETS) {
+      const px = x + o[0];
+      const py = y + o[1];
+      const pz = z + o[2];
+      const pi = idx(px, py, pz);
+      if (seen[pi]) continue;
+      seen[pi] = 1;
+      let config = 0;
+      for (const d of CORNER_OFFSETS) {
+        if (solid[idx(px - 1 + d[0], py - 1 + d[1], pz - 1 + d[2])]) {
+          config |= 1 << (d[0] * 4 + d[1] * 2 + d[2]);
+        }
+      }
+      if (CROSSING_DEFECT_CONFIG[config]) defects.push([px, py, pz]);
+    }
+  }
+  return defects;
+}
+
 /**
  * Compute the brink skeleton of a cube assembly.
  * @param {Array<{x:number,y:number,z:number}>} cubes - integer least corners

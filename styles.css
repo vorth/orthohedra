@@ -155,7 +155,11 @@ body {
   right: 12px;
   top: 12px;
   z-index: 10;
-  width: 220px;
+  /* Grow to fit one column per component, up to the window width; past
+     that, .metrics-body scrolls sideways. */
+  min-width: 220px;
+  width: max-content;
+  max-width: calc(100vw - 24px);
   border-radius: 12px;
   background: var(--panel);
   border: 1px solid var(--outline);
@@ -201,6 +205,8 @@ body {
 .metrics-body {
   padding: 8px 10px 10px;
   border-top: 1px solid var(--outline);
+  /* Past the panel's max-width, scroll rather than clip columns. */
+  overflow-x: auto;
 }
 
 /* One row per metric, one column per connected component. Columns are
@@ -226,7 +232,7 @@ body {
   padding: 2px 0 2px 8px;
 }
 
-/* Cubes and Squares are whole-design totals spanning every component column.
+/* Cubes, Squares and Crossing defects are whole-design totals spanning every component column.
    A rule goes under the LAST of them — i.e. the one not followed by another
    spanning row — to separate the globals from the per-component rows below. */
 #skeletonStats .metric-span:not(:has(+ .metric-span)) th,
